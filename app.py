@@ -6,7 +6,7 @@ import io
 import json
 import os
 import uuid
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -69,6 +69,8 @@ PROBABILITY_WEIGHTS = {"Alta": 0.90, "Média": 0.60, "Baixa": 0.30}
 FORECAST_COLUMNS = [
     "ID", "Ano", "Linha", "Competencia", "Cliente", "Tipo_Cliente",
     "Tipo_Receita", "Produto_Linha", "Quantidade", "Valor_Unitario",
+    "Data_Inicio_Contrato", "Prazo_Contrato_Meses", "Data_Fim_Contrato",
+    "Valor_Mensal_Contrato", "Receita_Contrato_Total", "Meses_No_Ano",
     "Receita_Prevista", "Probabilidade", "Peso_Probabilidade",
     "Receita_Ponderada", "Observacao", "Status", "Criado_Por",
     "Criado_Em", "Atualizado_Por", "Atualizado_Em",
@@ -166,6 +168,84 @@ def month_label_from_comp(value: str) -> str:
         return f"{MONTHS[p.month]}/{str(p.year)[2:]}"
     except Exception:
         return str(value)
+
+
+def date_br(value: object) -> str:
+    if value is None or str(value).strip() in {"", "nan", "NaT"}:
+        return ""
+    try:
+        return pd.Timestamp(value).strftime("%d/%m/%Y")
+    except Exception:
+        return str(value)
+
+
+def rental_projection(start_value: object, months_value: object, monthly_value: object) -> dict[str, object]:
+    """Calcula a vigência e a receita de locação que efetivamente pertence ao ano do Budget."""
+    try:
+        start = pd.Timestamp(start_value).normalize()
+        months = max(int(float(months_value)), 0)
+        monthly = max(float(monthly_value), 0.0)
+    except Exception:
+        return {"valid": False, "months": [], "months_in_year": 0, "revenue_year": 0.0, "contract_total": 0.0, "end": None, "first_comp": ""}
+    if pd.isna(start) or months <= 0 or monthly <= 0:
+        return {"valid": False, "months": [], "months_in_year": 0, "revenue_year": 0.0, "contract_total": 0.0, "end": None, "first_comp": ""}
+
+    periods = list(pd.period_range(start=start.to_period("M"), periods=months, freq="M"))
+    periods_year = [p for p in periods if p.year == APP_YEAR]
+    end = start + pd.DateOffset(months=months) - pd.Timedelta(days=1)
+    first_comp = str(periods_year[0]) if periods_year else str(start.to_period("M"))
+    return {
+        "valid": True,
+        "months": periods_year,
+        "months_in_year": len(periods_year),
+        "revenue_year": monthly * len(periods_year),
+        "contract_total": monthly * months,
+        "end": end,
+        "first_comp": first_comp,
+    }
+
+
+def forecast_period_label(row: pd.Series) -> str:
+    if norm(row.get("Tipo_Receita")) == "LOCACAO" and str(row.get("Data_Inicio_Contrato", "")).strip():
+        try:
+            prazo = int(float(row.get("Prazo_Contrato_Meses", 0) or 0))
+        except Exception:
+            prazo = 0
+        return f"{date_br(row.get('Data_Inicio_Contrato'))} a {date_br(row.get('Data_Fim_Contrato'))} · {prazo}m"
+    return month_label_from_comp(str(row.get("Competencia", "")))
+
+
+def expand_monthly_forecast(df: pd.DataFrame) -> pd.DataFrame:
+    """Expande contratos de locação por competência sem duplicar os registros gravados."""
+    if df is None or df.empty:
+        return pd.DataFrame(columns=FORECAST_COLUMNS)
+    rows: list[dict] = []
+    for _, source in df.iterrows():
+        row = source.to_dict()
+        if norm(row.get("Tipo_Receita")) == "LOCACAO":
+            proj = rental_projection(
+                row.get("Data_Inicio_Contrato"),
+                row.get("Prazo_Contrato_Meses"),
+                row.get("Valor_Mensal_Contrato"),
+            )
+            if proj["valid"] and proj["months"]:
+                peso = float(pd.to_numeric(pd.Series([row.get("Peso_Probabilidade")]), errors="coerce").fillna(0).iloc[0])
+                valor_mensal = float(pd.to_numeric(pd.Series([row.get("Valor_Mensal_Contrato")]), errors="coerce").fillna(0).iloc[0])
+                for period in proj["months"]:
+                    item = row.copy()
+                    item["Competencia"] = str(period)
+                    item["Receita_Prevista"] = valor_mensal
+                    item["Receita_Ponderada"] = valor_mensal * peso
+                    rows.append(item)
+                continue
+        rows.append(row)
+    out = pd.DataFrame(rows)
+    for col in FORECAST_COLUMNS:
+        if col not in out.columns:
+            out[col] = ""
+    for col in ["Quantidade", "Valor_Unitario", "Prazo_Contrato_Meses", "Valor_Mensal_Contrato", "Receita_Contrato_Total", "Meses_No_Ano", "Receita_Prevista", "Peso_Probabilidade", "Receita_Ponderada"]:
+        out[col] = pd.to_numeric(out[col], errors="coerce").fillna(0)
+    return out
 
 
 def hero(title: str, subtitle: str) -> None:
@@ -441,7 +521,11 @@ def history_file() -> str:
 
 def load_forecast() -> pd.DataFrame:
     df = load_table(forecast_file(), FORECAST_COLUMNS)
-    numeric = ["Ano", "Quantidade", "Valor_Unitario", "Receita_Prevista", "Peso_Probabilidade", "Receita_Ponderada"]
+    numeric = [
+        "Ano", "Quantidade", "Valor_Unitario", "Prazo_Contrato_Meses",
+        "Valor_Mensal_Contrato", "Receita_Contrato_Total", "Meses_No_Ano",
+        "Receita_Prevista", "Peso_Probabilidade", "Receita_Ponderada",
+    ]
     for col in numeric:
         df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
     return df
@@ -503,33 +587,54 @@ def export_excel(forecast: pd.DataFrame, history: pd.DataFrame) -> bytes:
     if not f.empty:
         f["Competência"] = f["Competencia"].map(month_label_from_comp)
         f["Linha"] = f["Linha"].map(line_label)
-        f["Valor Unitário"] = pd.to_numeric(f["Valor_Unitario"], errors="coerce").fillna(0)
-        f["Receita Prevista"] = pd.to_numeric(f["Receita_Prevista"], errors="coerce").fillna(0)
-        f["Receita Ponderada"] = pd.to_numeric(f["Receita_Ponderada"], errors="coerce").fillna(0)
+        f["Início Contrato"] = f["Data_Inicio_Contrato"].map(date_br)
+        f["Fim Contrato"] = f["Data_Fim_Contrato"].map(date_br)
+        for col in ["Valor_Unitario", "Valor_Mensal_Contrato", "Receita_Contrato_Total", "Receita_Prevista", "Receita_Ponderada"]:
+            f[col] = pd.to_numeric(f[col], errors="coerce").fillna(0)
 
-    active = f[f["Status"].astype(str).str.upper().eq("ATIVO")].copy() if not f.empty else f.copy()
+    active_raw = forecast[forecast["Status"].astype(str).str.upper().eq("ATIVO")].copy() if not forecast.empty else forecast.copy()
+    active_monthly = expand_monthly_forecast(active_raw)
+    mensal_detalhe = active_monthly.copy()
+    if not mensal_detalhe.empty:
+        mensal_detalhe["Linha"] = mensal_detalhe["Linha"].map(line_label)
+        mensal_detalhe["Mês"] = mensal_detalhe["Competencia"].map(month_label_from_comp)
+        mensal_detalhe = mensal_detalhe[[
+            "ID", "Linha", "Mês", "Cliente", "Tipo_Receita", "Produto_Linha",
+            "Receita_Prevista", "Receita_Ponderada", "Probabilidade"
+        ]].rename(columns={
+            "Tipo_Receita": "Tipo Receita", "Produto_Linha": "Produto / Oportunidade",
+            "Receita_Prevista": "Forecast Bruto", "Receita_Ponderada": "Forecast Ponderado",
+        })
+
     resumo_linha = pd.DataFrame()
     resumo_mes = pd.DataFrame()
-    if not active.empty:
-        resumo_linha = active.groupby("Linha", as_index=False).agg(
-            Forecast_Bruto=("Receita_Prevista", "sum"),
-            Forecast_Ponderado=("Receita_Ponderada", "sum"),
-            Registros=("ID", "count"),
-        )
-        resumo_mes = active.groupby("Competência", as_index=False).agg(
+    if not active_monthly.empty:
+        resumo_linha = active_monthly.groupby("Linha", as_index=False).agg(
             Forecast_Bruto=("Receita_Prevista", "sum"),
             Forecast_Ponderado=("Receita_Ponderada", "sum"),
         )
+        resumo_linha["Linha"] = resumo_linha["Linha"].map(line_label)
+        registros = active_raw.groupby("Linha", as_index=False).agg(Registros=("ID", "nunique"))
+        registros["Linha"] = registros["Linha"].map(line_label)
+        resumo_linha = resumo_linha.merge(registros, on="Linha", how="left")
+        resumo_mes = active_monthly.groupby("Competencia", as_index=False).agg(
+            Forecast_Bruto=("Receita_Prevista", "sum"),
+            Forecast_Ponderado=("Receita_Ponderada", "sum"),
+        )
+        resumo_mes["Mês"] = resumo_mes["Competencia"].map(month_label_from_comp)
+        resumo_mes = resumo_mes[["Mês", "Forecast_Bruto", "Forecast_Ponderado"]]
 
     with pd.ExcelWriter(out, engine="xlsxwriter") as writer:
         f.to_excel(writer, index=False, sheet_name="Forecast")
+        mensal_detalhe.to_excel(writer, index=False, sheet_name="Projeção Mensal")
         resumo_linha.to_excel(writer, index=False, sheet_name="Resumo Linha")
         resumo_mes.to_excel(writer, index=False, sheet_name="Resumo Mensal")
         history.to_excel(writer, index=False, sheet_name="Histórico")
         wb = writer.book
         header = wb.add_format({"bold": True, "font_color": "white", "bg_color": NAVY})
         money = wb.add_format({"num_format": 'R$ #,##0.00;[Red]-R$ #,##0.00'})
-        for ws_name, frame in [("Forecast", f), ("Resumo Linha", resumo_linha), ("Resumo Mensal", resumo_mes), ("Histórico", history)]:
+        frames = [("Forecast", f), ("Projeção Mensal", mensal_detalhe), ("Resumo Linha", resumo_linha), ("Resumo Mensal", resumo_mes), ("Histórico", history)]
+        for ws_name, frame in frames:
             ws = writer.sheets[ws_name]
             for idx, col in enumerate(frame.columns):
                 ws.write(0, idx, col, header)
@@ -613,6 +718,8 @@ forecast = load_forecast()
 history = load_history()
 active = forecast[forecast["Status"].astype(str).str.upper().eq("ATIVO")].copy() if not forecast.empty else forecast.copy()
 active_scope = scope_df(active, scope_choice)
+active_monthly = expand_monthly_forecast(active)
+active_monthly_scope = scope_df(active_monthly, scope_choice)
 
 
 # =========================================================
@@ -621,8 +728,8 @@ active_scope = scope_df(active, scope_choice)
 if page == "Visão Geral":
     hero("First Budget 2027", "Forecast comercial como ponto de partida do orçamento anual.")
 
-    bruto = float(active_scope["Receita_Prevista"].sum()) if not active_scope.empty else 0.0
-    ponderado = float(active_scope["Receita_Ponderada"].sum()) if not active_scope.empty else 0.0
+    bruto = float(active_monthly_scope["Receita_Prevista"].sum()) if not active_monthly_scope.empty else 0.0
+    ponderado = float(active_monthly_scope["Receita_Ponderada"].sum()) if not active_monthly_scope.empty else 0.0
     clientes = int(active_scope["Cliente"].replace("", np.nan).nunique()) if not active_scope.empty else 0
     registros = int(len(active_scope))
 
@@ -637,10 +744,10 @@ if page == "Visão Geral":
         kpi("Clientes previstos", f"{clientes}", f"{registros} lançamentos ativos")
 
     section("Evolução mensal")
-    if active_scope.empty:
+    if active_monthly_scope.empty:
         st.info("Ainda não existem lançamentos de forecast para este escopo.")
     else:
-        monthly = active_scope.groupby("Competencia", as_index=False).agg(
+        monthly = active_monthly_scope.groupby("Competencia", as_index=False).agg(
             Bruto=("Receita_Prevista", "sum"),
             Ponderado=("Receita_Ponderada", "sum"),
         )
@@ -655,7 +762,7 @@ if page == "Visão Geral":
 
         if is_director and scope_choice == "CONSOLIDADO":
             section("Participação por linha")
-            by_line = active_scope.groupby("Linha", as_index=False).agg(
+            by_line = active_monthly_scope.groupby("Linha", as_index=False).agg(
                 Bruto=("Receita_Prevista", "sum"), Ponderado=("Receita_Ponderada", "sum")
             )
             by_line["Linha_Label"] = by_line["Linha"].map(line_label)
@@ -670,10 +777,20 @@ if page == "Visão Geral":
 # PÁGINA: FORECAST COMERCIAL
 # =========================================================
 elif page == "Forecast Comercial":
-    hero("Forecast Comercial 2027", "Cada gestor alimenta somente sua linha; Controladoria pode atuar em todas.")
+    hero("Forecast Comercial 2027", "Venda e serviço são lançados por competência; locação é projetada automaticamente pelo prazo do contrato.")
 
     if can_edit:
         section("Novo lançamento")
+        default_rev_idx = 1 if (not can_edit_all and user.get("linha") == "LOCACAO") else 0
+        new_revenue_type = st.radio(
+            "Tipo de receita",
+            ["Venda", "Locação", "Serviço"],
+            index=default_rev_idx,
+            horizontal=True,
+            key="new_revenue_type",
+            help="Na locação, informe início, prazo e valor mensal. O sistema distribui a receita nas competências de 2027.",
+        )
+
         with st.form("new_forecast_form", clear_on_submit=True):
             a, b, c = st.columns(3)
             with a:
@@ -682,27 +799,50 @@ elif page == "Forecast Comercial":
                 else:
                     new_line = user["linha"]
                     st.text_input("Linha de negócio", value=line_label(new_line), disabled=True)
-                competencia = st.selectbox(
-                    "Mês previsto",
-                    [f"{APP_YEAR}-{m:02d}" for m in range(1, 13)],
-                    format_func=month_label_from_comp,
-                )
                 cliente = st.text_input("Cliente *")
-            with b:
                 tipo_cliente = st.selectbox("Tipo de cliente", ["Atual", "Novo"])
-                tipo_receita = st.selectbox("Tipo de receita", ["Venda", "Locação", "Serviço"])
-                produto = st.text_input("Produto / linha / oportunidade")
-            with c:
-                quantidade = st.number_input("Quantidade", min_value=0.0, value=1.0, step=1.0)
-                valor_unitario = st.number_input("Valor unitário", min_value=0.0, value=0.0, step=1000.0, format="%.2f")
-                valor_previsto = st.number_input(
-                    "Receita prevista",
-                    min_value=0.0,
-                    value=0.0,
-                    step=1000.0,
-                    format="%.2f",
-                    help="Se ficar zerado, o sistema usa Quantidade × Valor unitário.",
-                )
+
+            if new_revenue_type == "Locação":
+                with b:
+                    inicio_contrato = st.date_input(
+                        "Início do contrato",
+                        value=date(APP_YEAR, 1, 1),
+                        min_value=date(APP_YEAR - 7, 1, 1),
+                        max_value=date(APP_YEAR, 12, 31),
+                        format="DD/MM/YYYY",
+                    )
+                    prazo_contrato = st.number_input("Prazo do contrato (meses)", min_value=1, max_value=120, value=12, step=1)
+                    produto = st.text_input("Equipamento / linha / oportunidade")
+                with c:
+                    valor_mensal = st.number_input("Valor mensal da locação", min_value=0.0, value=0.0, step=1000.0, format="%.2f")
+                    quantidade = st.number_input("Quantidade de equipamentos", min_value=0.0, value=1.0, step=1.0)
+                    st.caption("A receita de 2027 será calculada pelos meses de vigência que pertencem ao ano do orçamento.")
+                competencia = ""
+                valor_unitario = float(valor_mensal)
+                valor_previsto = 0.0
+            else:
+                with b:
+                    competencia = st.selectbox(
+                        "Mês previsto",
+                        [f"{APP_YEAR}-{m:02d}" for m in range(1, 13)],
+                        format_func=month_label_from_comp,
+                    )
+                    produto = st.text_input("Produto / linha / oportunidade")
+                with c:
+                    quantidade = st.number_input("Quantidade", min_value=0.0, value=1.0, step=1.0)
+                    valor_unitario = st.number_input("Valor unitário", min_value=0.0, value=0.0, step=1000.0, format="%.2f")
+                    valor_previsto = st.number_input(
+                        "Receita prevista",
+                        min_value=0.0,
+                        value=0.0,
+                        step=1000.0,
+                        format="%.2f",
+                        help="Se ficar zerado, o sistema usa Quantidade × Valor unitário.",
+                    )
+                inicio_contrato = None
+                prazo_contrato = 0
+                valor_mensal = 0.0
+
             d, e = st.columns([1, 2])
             with d:
                 prob = st.selectbox("Probabilidade", list(PROBABILITY_WEIGHTS.keys()))
@@ -712,25 +852,52 @@ elif page == "Forecast Comercial":
 
         if submitted:
             cliente_clean = cliente.strip()
-            receita = float(valor_previsto) if float(valor_previsto) > 0 else float(quantidade) * float(valor_unitario)
+            peso = PROBABILITY_WEIGHTS[prob]
+            contract_data = {
+                "Data_Inicio_Contrato": "",
+                "Prazo_Contrato_Meses": 0,
+                "Data_Fim_Contrato": "",
+                "Valor_Mensal_Contrato": 0.0,
+                "Receita_Contrato_Total": 0.0,
+                "Meses_No_Ano": 0,
+            }
+
+            if new_revenue_type == "Locação":
+                proj = rental_projection(inicio_contrato, prazo_contrato, valor_mensal)
+                receita = float(proj["revenue_year"])
+                competencia_final = str(proj["first_comp"])
+                contract_data = {
+                    "Data_Inicio_Contrato": pd.Timestamp(inicio_contrato).strftime("%Y-%m-%d"),
+                    "Prazo_Contrato_Meses": int(prazo_contrato),
+                    "Data_Fim_Contrato": pd.Timestamp(proj["end"]).strftime("%Y-%m-%d") if proj["end"] is not None else "",
+                    "Valor_Mensal_Contrato": float(valor_mensal),
+                    "Receita_Contrato_Total": float(proj["contract_total"]),
+                    "Meses_No_Ano": int(proj["months_in_year"]),
+                }
+            else:
+                receita = float(valor_previsto) if float(valor_previsto) > 0 else float(quantidade) * float(valor_unitario)
+                competencia_final = competencia
+
             if not cliente_clean:
                 st.error("Informe o cliente.")
+            elif new_revenue_type == "Locação" and contract_data["Meses_No_Ano"] <= 0:
+                st.error(f"A vigência informada não possui receita dentro de {APP_YEAR}.")
             elif receita <= 0:
-                st.error("Informe a receita prevista ou Quantidade × Valor unitário.")
+                st.error("Informe um valor válido para a receita prevista.")
             else:
                 fid = f"FC-{APP_YEAR}-{uuid.uuid4().hex[:8].upper()}"
-                peso = PROBABILITY_WEIGHTS[prob]
                 row = {
                     "ID": fid,
                     "Ano": APP_YEAR,
                     "Linha": new_line,
-                    "Competencia": competencia,
+                    "Competencia": competencia_final,
                     "Cliente": cliente_clean,
                     "Tipo_Cliente": tipo_cliente,
-                    "Tipo_Receita": tipo_receita,
+                    "Tipo_Receita": new_revenue_type,
                     "Produto_Linha": produto.strip(),
                     "Quantidade": float(quantidade),
                     "Valor_Unitario": float(valor_unitario),
+                    **contract_data,
                     "Receita_Prevista": receita,
                     "Probabilidade": prob,
                     "Peso_Probabilidade": peso,
@@ -744,16 +911,27 @@ elif page == "Forecast Comercial":
                 }
                 try:
                     commit_forecast("INCLUSÃO", user, fid, new_line, None, row)
-                    st.success("Forecast incluído com sucesso.")
+                    if new_revenue_type == "Locação":
+                        st.success(
+                            f"Locação incluída. Receita projetada em {APP_YEAR}: {brl(receita)} · "
+                            f"{contract_data['Meses_No_Ano']} competência(s)."
+                        )
+                    else:
+                        st.success("Forecast incluído com sucesso.")
                     st.rerun()
                 except Exception as exc:
                     st.error(f"Não foi possível salvar: {exc}")
 
     section("Lançamentos ativos")
     scoped = scope_df(active, scope_choice)
+    scoped_monthly = scope_df(expand_monthly_forecast(active), scope_choice)
     f1, f2, f3 = st.columns(3)
     with f1:
-        month_filter = st.selectbox("Filtrar mês", ["Todos"] + [f"{APP_YEAR}-{m:02d}" for m in range(1, 13)], format_func=lambda x: x if x == "Todos" else month_label_from_comp(x))
+        month_filter = st.selectbox(
+            "Filtrar mês",
+            ["Todos"] + [f"{APP_YEAR}-{m:02d}" for m in range(1, 13)],
+            format_func=lambda x: x if x == "Todos" else month_label_from_comp(x),
+        )
     with f2:
         prob_filter = st.selectbox("Filtrar probabilidade", ["Todas"] + list(PROBABILITY_WEIGHTS.keys()))
     with f3:
@@ -761,7 +939,8 @@ elif page == "Forecast Comercial":
 
     view = scoped.copy()
     if month_filter != "Todos":
-        view = view[view["Competencia"].eq(month_filter)]
+        month_ids = scoped_monthly.loc[scoped_monthly["Competencia"].astype(str).eq(month_filter), "ID"].astype(str).unique().tolist()
+        view = view[view["ID"].astype(str).isin(month_ids)]
     if prob_filter != "Todas":
         view = view[view["Probabilidade"].eq(prob_filter)]
     if revenue_filter != "Todos":
@@ -770,20 +949,31 @@ elif page == "Forecast Comercial":
     if view.empty:
         st.info("Nenhum forecast encontrado para os filtros selecionados.")
     else:
-        show = view[["ID", "Linha", "Competencia", "Cliente", "Tipo_Cliente", "Tipo_Receita", "Produto_Linha", "Receita_Prevista", "Probabilidade", "Receita_Ponderada", "Atualizado_Por", "Atualizado_Em"]].copy()
+        show = view[[
+            "ID", "Linha", "Competencia", "Cliente", "Tipo_Cliente", "Tipo_Receita", "Produto_Linha",
+            "Data_Inicio_Contrato", "Data_Fim_Contrato", "Prazo_Contrato_Meses", "Valor_Mensal_Contrato",
+            "Receita_Prevista", "Probabilidade", "Receita_Ponderada", "Atualizado_Por", "Atualizado_Em"
+        ]].copy()
         show["Linha"] = show["Linha"].map(line_label)
-        show["Competencia"] = show["Competencia"].map(month_label_from_comp)
+        show["Mês / Vigência"] = show.apply(forecast_period_label, axis=1)
+        show = show.drop(columns=["Competencia", "Data_Inicio_Contrato", "Data_Fim_Contrato", "Prazo_Contrato_Meses"])
         show = show.rename(columns={
-            "Competencia": "Mês", "Tipo_Cliente": "Tipo cliente", "Tipo_Receita": "Receita",
-            "Produto_Linha": "Produto / Oportunidade", "Receita_Prevista": "Forecast Bruto",
-            "Receita_Ponderada": "Forecast Ponderado", "Atualizado_Por": "Atualizado por", "Atualizado_Em": "Atualizado em",
+            "Tipo_Cliente": "Tipo cliente", "Tipo_Receita": "Receita",
+            "Produto_Linha": "Produto / Oportunidade", "Valor_Mensal_Contrato": "Valor mensal",
+            "Receita_Prevista": f"Forecast {APP_YEAR}", "Receita_Ponderada": "Forecast Ponderado",
+            "Atualizado_Por": "Atualizado por", "Atualizado_Em": "Atualizado em",
         })
+        ordered = [
+            "ID", "Linha", "Mês / Vigência", "Cliente", "Tipo cliente", "Receita", "Produto / Oportunidade",
+            "Valor mensal", f"Forecast {APP_YEAR}", "Probabilidade", "Forecast Ponderado", "Atualizado por", "Atualizado em"
+        ]
         st.dataframe(
-            show,
+            show[ordered],
             width="stretch",
             hide_index=True,
             column_config={
-                "Forecast Bruto": st.column_config.NumberColumn(format="R$ %.2f"),
+                "Valor mensal": st.column_config.NumberColumn(format="R$ %.2f"),
+                f"Forecast {APP_YEAR}": st.column_config.NumberColumn(format="R$ %.2f"),
                 "Forecast Ponderado": st.column_config.NumberColumn(format="R$ %.2f"),
             },
         )
@@ -795,7 +985,14 @@ elif page == "Forecast Comercial":
             ids = editable_scope["ID"].astype(str).tolist()
             edit_id = st.selectbox("Selecione o lançamento", ids, key="edit_forecast_id")
             current = editable_scope.loc[editable_scope["ID"].astype(str).eq(edit_id)].iloc[0].to_dict()
-            row_index = forecast.index[forecast["ID"].astype(str).eq(edit_id)][0]
+            rev_opts = ["Venda", "Locação", "Serviço"]
+            current_rev = str(current.get("Tipo_Receita", "Venda"))
+            e_tipo_receita = st.selectbox(
+                "Tipo de receita",
+                rev_opts,
+                index=rev_opts.index(current_rev) if current_rev in rev_opts else 0,
+                key=f"edit_revenue_type_{edit_id}",
+            )
 
             with st.form(f"edit_form_{edit_id}"):
                 a, b, c = st.columns(3)
@@ -806,18 +1003,47 @@ elif page == "Forecast Comercial":
                     else:
                         e_line = user["linha"]
                         st.text_input("Linha", line_label(e_line), disabled=True)
-                    comps = [f"{APP_YEAR}-{m:02d}" for m in range(1, 13)]
-                    e_comp = st.selectbox("Mês", comps, index=comps.index(str(current["Competencia"])) if str(current["Competencia"]) in comps else 0, format_func=month_label_from_comp)
                     e_cliente = st.text_input("Cliente", value=str(current["Cliente"]))
-                with b:
                     e_tipo_cliente = st.selectbox("Tipo de cliente", ["Atual", "Novo"], index=0 if str(current["Tipo_Cliente"]) != "Novo" else 1)
-                    rev_opts = ["Venda", "Locação", "Serviço"]
-                    e_tipo_receita = st.selectbox("Tipo de receita", rev_opts, index=rev_opts.index(str(current["Tipo_Receita"])) if str(current["Tipo_Receita"]) in rev_opts else 0)
-                    e_produto = st.text_input("Produto / linha / oportunidade", value=str(current["Produto_Linha"]))
-                with c:
-                    e_qtd = st.number_input("Quantidade", min_value=0.0, value=float(current["Quantidade"] or 0), step=1.0)
-                    e_unit = st.number_input("Valor unitário", min_value=0.0, value=float(current["Valor_Unitario"] or 0), step=1000.0, format="%.2f")
-                    e_receita = st.number_input("Receita prevista", min_value=0.0, value=float(current["Receita_Prevista"] or 0), step=1000.0, format="%.2f")
+
+                if e_tipo_receita == "Locação":
+                    old_start = pd.to_datetime(current.get("Data_Inicio_Contrato"), errors="coerce")
+                    if pd.isna(old_start):
+                        try:
+                            old_start = pd.Period(str(current.get("Competencia", f"{APP_YEAR}-01")), freq="M").start_time
+                        except Exception:
+                            old_start = pd.Timestamp(APP_YEAR, 1, 1)
+                    old_term = int(float(current.get("Prazo_Contrato_Meses") or 0))
+                    if old_term <= 0:
+                        old_term = 1
+                    old_monthly = float(current.get("Valor_Mensal_Contrato") or 0)
+                    if old_monthly <= 0:
+                        old_monthly = float(current.get("Receita_Prevista") or 0)
+                    with b:
+                        e_inicio = st.date_input("Início do contrato", value=old_start.date(), min_value=date(APP_YEAR - 7, 1, 1), max_value=date(APP_YEAR, 12, 31), format="DD/MM/YYYY")
+                        e_prazo = st.number_input("Prazo do contrato (meses)", min_value=1, max_value=120, value=old_term, step=1)
+                        e_produto = st.text_input("Equipamento / linha / oportunidade", value=str(current["Produto_Linha"]))
+                    with c:
+                        e_monthly = st.number_input("Valor mensal da locação", min_value=0.0, value=old_monthly, step=1000.0, format="%.2f")
+                        e_qtd = st.number_input("Quantidade de equipamentos", min_value=0.0, value=float(current["Quantidade"] or 0), step=1.0)
+                        st.caption("A alteração recalcula automaticamente todas as competências de 2027 cobertas pelo contrato.")
+                    e_comp = ""
+                    e_unit = e_monthly
+                    e_receita = 0.0
+                else:
+                    with b:
+                        comps = [f"{APP_YEAR}-{m:02d}" for m in range(1, 13)]
+                        current_comp = str(current.get("Competencia", f"{APP_YEAR}-01"))
+                        e_comp = st.selectbox("Mês", comps, index=comps.index(current_comp) if current_comp in comps else 0, format_func=month_label_from_comp)
+                        e_produto = st.text_input("Produto / linha / oportunidade", value=str(current["Produto_Linha"]))
+                    with c:
+                        e_qtd = st.number_input("Quantidade", min_value=0.0, value=float(current["Quantidade"] or 0), step=1.0)
+                        e_unit = st.number_input("Valor unitário", min_value=0.0, value=float(current["Valor_Unitario"] or 0), step=1000.0, format="%.2f")
+                        e_receita = st.number_input("Receita prevista", min_value=0.0, value=float(current["Receita_Prevista"] or 0), step=1000.0, format="%.2f")
+                    e_inicio = None
+                    e_prazo = 0
+                    e_monthly = 0.0
+
                 d, e = st.columns([1, 2])
                 with d:
                     probs = list(PROBABILITY_WEIGHTS.keys())
@@ -827,23 +1053,46 @@ elif page == "Forecast Comercial":
                 update_btn = st.form_submit_button("Salvar alterações", width="stretch")
 
             if update_btn:
-                if not e_cliente.strip() or e_receita <= 0:
-                    st.error("Cliente e receita prevista são obrigatórios.")
+                peso = PROBABILITY_WEIGHTS[e_prob]
+                contract_updates = {
+                    "Data_Inicio_Contrato": "", "Prazo_Contrato_Meses": 0, "Data_Fim_Contrato": "",
+                    "Valor_Mensal_Contrato": 0.0, "Receita_Contrato_Total": 0.0, "Meses_No_Ano": 0,
+                }
+                if e_tipo_receita == "Locação":
+                    proj = rental_projection(e_inicio, e_prazo, e_monthly)
+                    receita_edit = float(proj["revenue_year"])
+                    comp_edit = str(proj["first_comp"])
+                    contract_updates = {
+                        "Data_Inicio_Contrato": pd.Timestamp(e_inicio).strftime("%Y-%m-%d"),
+                        "Prazo_Contrato_Meses": int(e_prazo),
+                        "Data_Fim_Contrato": pd.Timestamp(proj["end"]).strftime("%Y-%m-%d") if proj["end"] is not None else "",
+                        "Valor_Mensal_Contrato": float(e_monthly),
+                        "Receita_Contrato_Total": float(proj["contract_total"]),
+                        "Meses_No_Ano": int(proj["months_in_year"]),
+                    }
                 else:
-                    before = forecast.loc[row_index].to_dict()
-                    peso = PROBABILITY_WEIGHTS[e_prob]
+                    receita_edit = float(e_receita) if float(e_receita) > 0 else float(e_qtd) * float(e_unit)
+                    comp_edit = e_comp
+
+                if not e_cliente.strip():
+                    st.error("Informe o cliente.")
+                elif e_tipo_receita == "Locação" and contract_updates["Meses_No_Ano"] <= 0:
+                    st.error(f"A vigência informada não possui receita dentro de {APP_YEAR}.")
+                elif receita_edit <= 0:
+                    st.error("Informe um valor válido para a receita prevista.")
+                else:
+                    before = current.copy()
                     updates = {
-                        "Linha": e_line, "Competencia": e_comp, "Cliente": e_cliente.strip(),
+                        "Linha": e_line, "Competencia": comp_edit, "Cliente": e_cliente.strip(),
                         "Tipo_Cliente": e_tipo_cliente, "Tipo_Receita": e_tipo_receita,
                         "Produto_Linha": e_produto.strip(), "Quantidade": float(e_qtd),
-                        "Valor_Unitario": float(e_unit), "Receita_Prevista": float(e_receita),
-                        "Probabilidade": e_prob, "Peso_Probabilidade": peso,
-                        "Receita_Ponderada": float(e_receita) * peso, "Observacao": e_obs.strip(),
-                        "Atualizado_Por": user["nome"], "Atualizado_Em": now_text(),
+                        "Valor_Unitario": float(e_unit), **contract_updates,
+                        "Receita_Prevista": receita_edit, "Probabilidade": e_prob,
+                        "Peso_Probabilidade": peso, "Receita_Ponderada": receita_edit * peso,
+                        "Observacao": e_obs.strip(), "Atualizado_Por": user["nome"], "Atualizado_Em": now_text(),
                     }
-                    for key, value in updates.items():
-                        forecast.at[row_index, key] = value
-                    after = forecast.loc[row_index].to_dict()
+                    after = before.copy()
+                    after.update(updates)
                     try:
                         commit_forecast("ALTERAÇÃO", user, edit_id, e_line, before, after)
                         st.success("Forecast alterado.")
@@ -855,12 +1104,11 @@ elif page == "Forecast Comercial":
             del_id = st.selectbox("Lançamento para exclusão", editable_scope["ID"].astype(str).tolist(), key="delete_forecast_id")
             confirm = st.checkbox("Confirmo a exclusão deste lançamento")
             if st.button("Excluir lançamento", type="secondary", disabled=not confirm, width="stretch"):
-                idx = forecast.index[forecast["ID"].astype(str).eq(del_id)][0]
-                before = forecast.loc[idx].to_dict()
-                forecast.at[idx, "Status"] = "EXCLUIDO"
-                forecast.at[idx, "Atualizado_Por"] = user["nome"]
-                forecast.at[idx, "Atualizado_Em"] = now_text()
-                after = forecast.loc[idx].to_dict()
+                before = editable_scope.loc[editable_scope["ID"].astype(str).eq(del_id)].iloc[0].to_dict()
+                after = before.copy()
+                after["Status"] = "EXCLUIDO"
+                after["Atualizado_Por"] = user["nome"]
+                after["Atualizado_Em"] = now_text()
                 try:
                     commit_forecast("EXCLUSÃO", user, del_id, str(before.get("Linha", "")), before, after)
                     st.success("Lançamento excluído e mantido no histórico.")
@@ -873,18 +1121,22 @@ elif page == "Forecast Comercial":
 # PÁGINA: CONSOLIDAÇÃO
 # =========================================================
 elif page == "Consolidação":
-    hero("Consolidação do Forecast", "Visão mensal e anual pronta para alimentar o orçamento de receita.")
-    scoped = scope_df(active, scope_choice)
+    hero("Consolidação do Forecast", "A locação é distribuída mês a mês conforme a vigência; venda e serviço permanecem na competência informada.")
+    scoped_raw = scope_df(active, scope_choice)
+    scoped_monthly = scope_df(expand_monthly_forecast(active), scope_choice)
 
-    if scoped.empty:
+    if scoped_raw.empty:
         st.info("Ainda não há forecast para consolidar neste escopo.")
     else:
-        resumo = scoped.groupby("Linha", as_index=False).agg(
+        resumo_receita = scoped_monthly.groupby("Linha", as_index=False).agg(
             Forecast_Bruto=("Receita_Prevista", "sum"),
             Forecast_Ponderado=("Receita_Ponderada", "sum"),
-            Clientes=("Cliente", "nunique"),
-            Lancamentos=("ID", "count"),
         )
+        resumo_base = scoped_raw.groupby("Linha", as_index=False).agg(
+            Clientes=("Cliente", "nunique"),
+            Lancamentos=("ID", "nunique"),
+        )
+        resumo = resumo_receita.merge(resumo_base, on="Linha", how="outer").fillna(0)
         resumo["Cobertura"] = np.where(resumo["Forecast_Bruto"] != 0, (resumo["Forecast_Ponderado"] / resumo["Forecast_Bruto"]) * 100, 0)
         resumo["Linha"] = resumo["Linha"].map(line_label)
 
@@ -901,7 +1153,7 @@ elif page == "Consolidação":
         )
 
         section("Matriz mensal")
-        matrix = scoped.pivot_table(index="Linha", columns="Competencia", values="Receita_Prevista", aggfunc="sum", fill_value=0)
+        matrix = scoped_monthly.pivot_table(index="Linha", columns="Competencia", values="Receita_Prevista", aggfunc="sum", fill_value=0)
         for comp in [f"{APP_YEAR}-{m:02d}" for m in range(1, 13)]:
             if comp not in matrix.columns:
                 matrix[comp] = 0.0
@@ -920,7 +1172,7 @@ elif page == "Consolidação":
         scoped_history = history.copy()
         if not is_director and not scoped_history.empty:
             scoped_history = scoped_history[scoped_history["Linha"].astype(str).map(norm).eq(user["linha"])]
-        xlsx = export_excel(scoped, scoped_history)
+        xlsx = export_excel(scoped_raw, scoped_history)
         st.download_button(
             "Baixar consolidação em Excel",
             data=xlsx,
