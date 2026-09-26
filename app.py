@@ -65,6 +65,8 @@ MONTHS = {
     7: "Jul", 8: "Ago", 9: "Set", 10: "Out", 11: "Nov", 12: "Dez",
 }
 PROBABILITY_WEIGHTS = {"Alta": 0.90, "Média": 0.60, "Baixa": 0.30}
+NEW_CLIENT_OPTION = "➕ Novo cliente"
+NEW_PRODUCT_OPTION = "➕ Novo equipamento / produto / oportunidade"
 
 FORECAST_COLUMNS = [
     "ID", "Ano", "Linha", "Competencia", "Cliente", "Tipo_Cliente",
@@ -180,6 +182,128 @@ def date_br(value: object) -> str:
         return str(value)
 
 
+def _optional_col(df: pd.DataFrame, candidates: list[str]) -> str | None:
+    lookup = {norm(c): c for c in df.columns}
+    for candidate in candidates:
+        if norm(candidate) in lookup:
+            return lookup[norm(candidate)]
+    return None
+
+
+def _master_base_path() -> Path | None:
+    """Localiza a BASE BI no mesmo repositório do Budget, sem acoplar o app ao Intelligence."""
+    here = Path(__file__).resolve().parent
+    preferred = [
+        "BASE BI.xlsx", "BASE BI.xlsm", "BASE BI(1).xlsx",
+        "base_bi.xlsx", "rev2026 Base bi.xlsx", "rev2026 Base bi.xlsm",
+    ]
+    for name in preferred:
+        candidate = here / name
+        if candidate.exists() and not candidate.name.startswith("~$"):
+            return candidate
+    candidates = []
+    for path in here.glob("*.xls*"):
+        if path.name.startswith("~$"):
+            continue
+        key = norm(path.stem)
+        if "BASE" in key and "BI" in key:
+            candidates.append(path)
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: ("REV2026" in norm(x.stem), x.name.casefold()))
+    return candidates[0]
+
+
+@st.cache_data(show_spinner=False, ttl=300)
+def _read_master_catalog(path_text: str, modified_ns: int) -> dict[str, object]:
+    """Lê somente clientes e produtos da BASE BI para agilizar os lançamentos."""
+    path = Path(path_text)
+    try:
+        book = pd.ExcelFile(path, engine="openpyxl")
+        if "BANCO DE DADOS FATURAMENTO" not in book.sheet_names:
+            return {"clients": [], "products": [], "source": path.name, "warning": "A aba BANCO DE DADOS FATURAMENTO não foi localizada."}
+        df = pd.read_excel(path, sheet_name="BANCO DE DADOS FATURAMENTO", engine="openpyxl")
+    except Exception as exc:
+        return {"clients": [], "products": [], "source": path.name, "warning": f"Não foi possível ler a BASE BI: {exc}"}
+
+    client_col = _optional_col(df, ["NOME DO CLIENTE", "CLIENTE", "RAZÃO SOCIAL", "RAZAO SOCIAL"])
+    product_col = _optional_col(df, ["PRODUTO", "ITEM", "CÓDIGO PRODUTO", "CODIGO PRODUTO"])
+    desc_col = _optional_col(df, ["DESCRIÇÃO", "DESCRICAO", "LINHA DE PRODUTO"])
+
+    clients = []
+    if client_col:
+        clients = sorted({
+            str(value).strip() for value in df[client_col].dropna().tolist()
+            if str(value).strip() and norm(value) not in {"NAO INFORMADO", "NAN", "NONE"}
+        }, key=lambda x: norm(x))
+
+    products = []
+    if product_col or desc_col:
+        codes = df[product_col].fillna("").astype(str).str.strip() if product_col else pd.Series("", index=df.index)
+        descs = df[desc_col].fillna("").astype(str).str.strip() if desc_col else pd.Series("", index=df.index)
+        labels = []
+        for code, desc in zip(codes, descs):
+            if norm(code) in {"NAN", "NONE", "NAO INFORMADO"}:
+                code = ""
+            if norm(desc) in {"NAN", "NONE", "NAO INFORMADO"}:
+                desc = ""
+            label = f"{code} | {desc}" if code and desc and norm(code) != norm(desc) else (code or desc)
+            if label:
+                labels.append(label)
+        products = sorted(set(labels), key=lambda x: norm(x))
+
+    return {"clients": clients, "products": products, "source": path.name, "warning": ""}
+
+
+def build_input_catalog(forecast_df: pd.DataFrame) -> dict[str, object]:
+    """Combina cadastro mestre da BASE BI com nomes já utilizados no First Budget."""
+    path = _master_base_path()
+    master = {"clients": [], "products": [], "source": "", "warning": "BASE BI não localizada no repositório do Budget."}
+    if path is not None:
+        master = _read_master_catalog(str(path), path.stat().st_mtime_ns)
+
+    master_clients = list(master.get("clients", []))
+    master_products = list(master.get("products", []))
+    forecast_clients = []
+    forecast_products = []
+    if forecast_df is not None and not forecast_df.empty:
+        if "Cliente" in forecast_df.columns:
+            forecast_clients = [str(x).strip() for x in forecast_df["Cliente"].dropna().tolist() if str(x).strip()]
+        if "Produto_Linha" in forecast_df.columns:
+            forecast_products.extend([str(x).strip() for x in forecast_df["Produto_Linha"].dropna().tolist() if str(x).strip()])
+        if "Itens_Contrato_JSON" in forecast_df.columns:
+            for raw in forecast_df["Itens_Contrato_JSON"].dropna().astype(str):
+                try:
+                    payload = json.loads(raw) if raw.strip() else []
+                    if isinstance(payload, list):
+                        forecast_products.extend(str(item.get("Equipamento", "")).strip() for item in payload if str(item.get("Equipamento", "")).strip())
+                except Exception:
+                    pass
+
+    def unique_labels(values: list[str]) -> list[str]:
+        out = {}
+        for value in values:
+            label = str(value).strip()
+            key = norm(label)
+            if label and key and key not in out:
+                out[key] = label
+        return sorted(out.values(), key=lambda x: norm(x))
+
+    clients = unique_labels(master_clients + forecast_clients)
+    products = unique_labels(master_products + forecast_products)
+    master_keys = {norm(x) for x in master_clients}
+    client_types = {name: ("Atual" if norm(name) in master_keys else "Novo") for name in clients}
+    return {
+        "clients": clients, "products": products, "client_types": client_types,
+        "master_client_count": len(master_clients), "master_product_count": len(master_products),
+        "source": str(master.get("source", "")), "warning": str(master.get("warning", "")),
+    }
+
+
+def resolve_catalog_choice(selected: str, manual: str, new_option: str) -> str:
+    return str(manual or "").strip() if selected == new_option else str(selected or "").strip()
+
+
 def rental_projection(start_value: object, months_value: object, monthly_value: object) -> dict[str, object]:
     """Calcula a vigência e a receita de locação que efetivamente pertence ao ano do Budget."""
     try:
@@ -245,11 +369,17 @@ def contract_items_metrics(editor_value: object) -> dict[str, object]:
     for col in CONTRACT_ITEM_COLUMNS:
         if col not in frame.columns:
             frame[col] = "" if col in {"Equipamento", "Observacao_Item"} else 0.0
-    frame = frame[CONTRACT_ITEM_COLUMNS].copy()
+    if "Equipamento_Novo" not in frame.columns:
+        frame["Equipamento_Novo"] = ""
+    frame = frame[CONTRACT_ITEM_COLUMNS + ["Equipamento_Novo"]].copy()
     frame["Equipamento"] = frame["Equipamento"].fillna("").astype(str).str.strip()
+    frame["Equipamento_Novo"] = frame["Equipamento_Novo"].fillna("").astype(str).str.strip()
     frame["Observacao_Item"] = frame["Observacao_Item"].fillna("").astype(str).str.strip()
     frame["Quantidade"] = pd.to_numeric(frame["Quantidade"], errors="coerce").fillna(0.0)
     frame["Valor_Mensal_Unitario"] = pd.to_numeric(frame["Valor_Mensal_Unitario"], errors="coerce").fillna(0.0)
+
+    is_new_equipment = frame["Equipamento"].eq(NEW_PRODUCT_OPTION)
+    frame.loc[is_new_equipment, "Equipamento"] = frame.loc[is_new_equipment, "Equipamento_Novo"]
 
     # Remove apenas linhas totalmente vazias; linhas parcialmente preenchidas devem gerar validação.
     blank = (frame["Equipamento"].eq("") & frame["Quantidade"].eq(0) & frame["Valor_Mensal_Unitario"].eq(0) & frame["Observacao_Item"].eq(""))
@@ -257,7 +387,7 @@ def contract_items_metrics(editor_value: object) -> dict[str, object]:
     if frame.empty:
         return {"valid": False, "error": "Inclua pelo menos um equipamento no contrato.", "df": frame}
     if frame["Equipamento"].eq("").any():
-        return {"valid": False, "error": "Informe o equipamento em todas as linhas do contrato.", "df": frame}
+        return {"valid": False, "error": "Informe o equipamento em todas as linhas do contrato. Para item novo, preencha a coluna Novo equipamento.", "df": frame}
     if frame["Quantidade"].le(0).any():
         return {"valid": False, "error": "A quantidade de cada equipamento deve ser maior que zero.", "df": frame}
     if frame["Valor_Mensal_Unitario"].le(0).any():
@@ -844,6 +974,10 @@ with st.sidebar:
 forecast = load_forecast()
 history = load_history()
 active = forecast[forecast["Status"].astype(str).str.upper().eq("ATIVO")].copy() if not forecast.empty else forecast.copy()
+input_catalog = build_input_catalog(forecast)
+CLIENT_OPTIONS = list(input_catalog.get("clients", []))
+PRODUCT_OPTIONS = list(input_catalog.get("products", []))
+CLIENT_TYPES = dict(input_catalog.get("client_types", {}))
 active_scope = scope_df(active, scope_choice)
 active_monthly = expand_monthly_forecast(active)
 active_monthly_scope = scope_df(active_monthly, scope_choice)
@@ -906,6 +1040,16 @@ if page == "Visão Geral":
 elif page == "Forecast Comercial":
     hero("Forecast Comercial 2027", "Venda e serviço são lançados por competência; locação é projetada automaticamente pelo prazo do contrato.")
 
+    source_name = str(input_catalog.get("source", "") or "")
+    if source_name:
+        st.caption(
+            f"Cadastros carregados de {source_name}: "
+            f"{int(input_catalog.get('master_client_count', 0)):,} clientes e "
+            f"{int(input_catalog.get('master_product_count', 0)):,} produtos.".replace(",", ".")
+        )
+    else:
+        st.caption("BASE BI não localizada neste repositório. As listas usam apenas clientes e produtos já gravados no Budget.")
+
     if can_edit:
         section("Novo lançamento")
         default_rev_idx = 1 if (not can_edit_all and user.get("linha") == "LOCACAO") else 0
@@ -926,8 +1070,15 @@ elif page == "Forecast Comercial":
                 else:
                     new_line = user["linha"]
                     st.text_input("Linha de negócio", value=line_label(new_line), disabled=True)
-                cliente = st.text_input("Cliente *")
-                tipo_cliente = st.selectbox("Tipo de cliente", ["Atual", "Novo"])
+                client_choices = CLIENT_OPTIONS + [NEW_CLIENT_OPTION]
+                cliente_selecionado = st.selectbox(
+                    "Cliente *", client_choices,
+                    index=0 if CLIENT_OPTIONS else len(client_choices) - 1,
+                    help="Digite parte do nome para pesquisar. A lista usa a BASE BI e clientes já registrados no Budget.",
+                )
+                novo_cliente = st.text_input("Novo cliente", placeholder="Preencha somente se escolher + Novo cliente")
+                tipo_cliente = CLIENT_TYPES.get(cliente_selecionado, "Novo") if cliente_selecionado != NEW_CLIENT_OPTION else "Novo"
+                st.caption(f"Classificação: {tipo_cliente}")
 
             if new_revenue_type == "Locação":
                 with b:
@@ -944,22 +1095,28 @@ elif page == "Forecast Comercial":
                     st.caption("O mesmo contrato pode conter vários equipamentos. A receita mensal será a soma de todos os itens.")
 
                 st.markdown("**Equipamentos do contrato**")
+                rental_seed = pd.DataFrame([{
+                    "Equipamento": "", "Equipamento_Novo": "", "Quantidade": 1.0,
+                    "Valor_Mensal_Unitario": 0.0, "Observacao_Item": ""
+                }])
+                equipment_cfg = (
+                    st.column_config.SelectboxColumn(
+                        "Equipamento / produto *", options=[""] + PRODUCT_OPTIONS + [NEW_PRODUCT_OPTION], required=True,
+                        help="Pesquise no cadastro ou escolha + Novo equipamento / produto / oportunidade.",
+                    ) if PRODUCT_OPTIONS else st.column_config.TextColumn("Equipamento / produto *", required=True)
+                )
                 itens_locacao = st.data_editor(
-                    pd.DataFrame([{
-                        "Equipamento": "", "Quantidade": 1.0, "Valor_Mensal_Unitario": 0.0, "Observacao_Item": ""
-                    }], columns=CONTRACT_ITEM_COLUMNS),
-                    num_rows="dynamic",
-                    hide_index=True,
-                    width="stretch",
-                    key="new_rental_items",
+                    rental_seed, num_rows="dynamic", hide_index=True, width="stretch", key="new_rental_items",
                     column_config={
-                        "Equipamento": st.column_config.TextColumn("Equipamento / produto *", required=True),
+                        "Equipamento": equipment_cfg,
+                        "Equipamento_Novo": st.column_config.TextColumn("Novo equipamento", help="Preencha somente quando o item não existir no cadastro."),
                         "Quantidade": st.column_config.NumberColumn("Qtd. *", min_value=0.0, step=1.0, format="%.0f"),
                         "Valor_Mensal_Unitario": st.column_config.NumberColumn("Valor mensal unit. *", min_value=0.0, step=100.0, format="R$ %.2f"),
                         "Observacao_Item": st.column_config.TextColumn("Observação do item"),
                     },
+                    column_order=["Equipamento", "Equipamento_Novo", "Quantidade", "Valor_Mensal_Unitario", "Observacao_Item"],
                 )
-                st.caption("Use o botão + da tabela para adicionar outros equipamentos ao mesmo contrato.")
+                st.caption("Use + para adicionar equipamentos. Se o item não existir, escolha a opção de novo e digite o nome na coluna seguinte.")
                 competencia = ""
                 produto = ""
                 quantidade = 0.0
@@ -973,7 +1130,14 @@ elif page == "Forecast Comercial":
                         [f"{APP_YEAR}-{m:02d}" for m in range(1, 13)],
                         format_func=month_label_from_comp,
                     )
-                    produto = st.text_input("Produto / linha / oportunidade")
+                    product_choices = PRODUCT_OPTIONS + [NEW_PRODUCT_OPTION]
+                    produto_selecionado = st.selectbox(
+                        "Produto / linha / oportunidade", product_choices,
+                        index=0 if PRODUCT_OPTIONS else len(product_choices) - 1,
+                        help="Digite parte do código ou descrição para pesquisar no cadastro existente.",
+                    )
+                    produto_novo = st.text_input("Novo produto / oportunidade", placeholder="Preencha somente se não existir no cadastro")
+                    produto = resolve_catalog_choice(produto_selecionado, produto_novo, NEW_PRODUCT_OPTION)
                 with c:
                     quantidade = st.number_input("Quantidade", min_value=0.0, value=1.0, step=1.0)
                     valor_unitario = st.number_input("Valor unitário", min_value=0.0, value=0.0, step=1000.0, format="%.2f")
@@ -999,7 +1163,7 @@ elif page == "Forecast Comercial":
             submitted = st.form_submit_button("Salvar forecast", width="stretch")
 
         if submitted:
-            cliente_clean = cliente.strip()
+            cliente_clean = resolve_catalog_choice(cliente_selecionado, novo_cliente, NEW_CLIENT_OPTION)
             peso = PROBABILITY_WEIGHTS[prob]
             contract_data = {
                 "Data_Inicio_Contrato": "",
@@ -1165,8 +1329,20 @@ elif page == "Forecast Comercial":
                     else:
                         e_line = user["linha"]
                         st.text_input("Linha", line_label(e_line), disabled=True)
-                    e_cliente = st.text_input("Cliente", value=str(current["Cliente"]))
-                    e_tipo_cliente = st.selectbox("Tipo de cliente", ["Atual", "Novo"], index=0 if str(current["Tipo_Cliente"]) != "Novo" else 1)
+                    current_client = str(current.get("Cliente", "") or "").strip()
+                    edit_client_options = list(CLIENT_OPTIONS)
+                    if current_client and current_client not in edit_client_options:
+                        edit_client_options.append(current_client)
+                    edit_client_options = sorted(edit_client_options, key=lambda x: norm(x)) + [NEW_CLIENT_OPTION]
+                    e_cliente_selecionado = st.selectbox(
+                        "Cliente", edit_client_options,
+                        index=edit_client_options.index(current_client) if current_client in edit_client_options else len(edit_client_options) - 1,
+                        help="Pesquise pelo cadastro existente ou escolha + Novo cliente.",
+                    )
+                    e_novo_cliente = st.text_input("Novo cliente", placeholder="Preencha somente se escolher + Novo cliente")
+                    e_tipo_cliente = (CLIENT_TYPES.get(e_cliente_selecionado, str(current.get("Tipo_Cliente", "Novo") or "Novo"))
+                                      if e_cliente_selecionado != NEW_CLIENT_OPTION else "Novo")
+                    st.caption(f"Classificação: {e_tipo_cliente}")
 
                 if e_tipo_receita == "Locação":
                     old_start = pd.to_datetime(current.get("Data_Inicio_Contrato"), errors="coerce")
@@ -1191,20 +1367,34 @@ elif page == "Forecast Comercial":
                         legacy_items = pd.DataFrame([{
                             "Equipamento": "", "Quantidade": 1.0, "Valor_Mensal_Unitario": 0.0, "Observacao_Item": ""
                         }], columns=CONTRACT_ITEM_COLUMNS)
+                    legacy_items = legacy_items.copy()
+                    legacy_items["Equipamento_Novo"] = ""
+                    extra_items = [str(x).strip() for x in legacy_items["Equipamento"].dropna().tolist() if str(x).strip()]
+                    edit_product_options = []
+                    seen_products = set()
+                    for value in PRODUCT_OPTIONS + extra_items:
+                        key = norm(value)
+                        if key and key not in seen_products:
+                            seen_products.add(key)
+                            edit_product_options.append(value)
+                    edit_equipment_cfg = (
+                        st.column_config.SelectboxColumn(
+                            "Equipamento / produto *", options=[""] + edit_product_options + [NEW_PRODUCT_OPTION], required=True,
+                            help="Pesquise no cadastro ou escolha + Novo equipamento / produto / oportunidade.",
+                        ) if edit_product_options else st.column_config.TextColumn("Equipamento / produto *", required=True)
+                    )
                     e_items = st.data_editor(
-                        legacy_items,
-                        num_rows="dynamic",
-                        hide_index=True,
-                        width="stretch",
-                        key=f"edit_rental_items_{edit_id}",
+                        legacy_items, num_rows="dynamic", hide_index=True, width="stretch", key=f"edit_rental_items_{edit_id}",
                         column_config={
-                            "Equipamento": st.column_config.TextColumn("Equipamento / produto *", required=True),
+                            "Equipamento": edit_equipment_cfg,
+                            "Equipamento_Novo": st.column_config.TextColumn("Novo equipamento", help="Preencha somente quando o item não existir no cadastro."),
                             "Quantidade": st.column_config.NumberColumn("Qtd. *", min_value=0.0, step=1.0, format="%.0f"),
                             "Valor_Mensal_Unitario": st.column_config.NumberColumn("Valor mensal unit. *", min_value=0.0, step=100.0, format="R$ %.2f"),
                             "Observacao_Item": st.column_config.TextColumn("Observação do item"),
                         },
+                        column_order=["Equipamento", "Equipamento_Novo", "Quantidade", "Valor_Mensal_Unitario", "Observacao_Item"],
                     )
-                    st.caption("Use + para incluir outro equipamento ou exclua uma linha da grade para removê-lo do contrato.")
+                    st.caption("Use + para incluir outro equipamento. Se for um item novo, escolha a opção de novo e informe o nome na coluna seguinte.")
                     e_comp = ""
                     e_produto = ""
                     e_qtd = 0.0
@@ -1216,7 +1406,18 @@ elif page == "Forecast Comercial":
                         comps = [f"{APP_YEAR}-{m:02d}" for m in range(1, 13)]
                         current_comp = str(current.get("Competencia", f"{APP_YEAR}-01"))
                         e_comp = st.selectbox("Mês", comps, index=comps.index(current_comp) if current_comp in comps else 0, format_func=month_label_from_comp)
-                        e_produto = st.text_input("Produto / linha / oportunidade", value=str(current["Produto_Linha"]))
+                        current_product = str(current.get("Produto_Linha", "") or "").strip()
+                        edit_product_choices = list(PRODUCT_OPTIONS)
+                        if current_product and current_product not in edit_product_choices:
+                            edit_product_choices.append(current_product)
+                        edit_product_choices = sorted(edit_product_choices, key=lambda x: norm(x)) + [NEW_PRODUCT_OPTION]
+                        e_produto_selecionado = st.selectbox(
+                            "Produto / linha / oportunidade", edit_product_choices,
+                            index=edit_product_choices.index(current_product) if current_product in edit_product_choices else len(edit_product_choices) - 1,
+                            help="Pesquise no cadastro existente ou escolha a opção de novo.",
+                        )
+                        e_produto_novo = st.text_input("Novo produto / oportunidade", placeholder="Preencha somente se não existir no cadastro")
+                        e_produto = resolve_catalog_choice(e_produto_selecionado, e_produto_novo, NEW_PRODUCT_OPTION)
                     with c:
                         e_qtd = st.number_input("Quantidade", min_value=0.0, value=float(current["Quantidade"] or 0), step=1.0)
                         e_unit = st.number_input("Valor unitário", min_value=0.0, value=float(current["Valor_Unitario"] or 0), step=1000.0, format="%.2f")
@@ -1266,7 +1467,8 @@ elif page == "Forecast Comercial":
                     receita_edit = float(e_receita) if float(e_receita) > 0 else float(e_qtd) * float(e_unit)
                     comp_edit = e_comp
 
-                if not e_cliente.strip():
+                e_cliente_final = resolve_catalog_choice(e_cliente_selecionado, e_novo_cliente, NEW_CLIENT_OPTION)
+                if not e_cliente_final:
                     st.error("Informe o cliente.")
                 elif e_tipo_receita == "Locação" and not edit_item_metrics.get("valid"):
                     st.error(str(edit_item_metrics.get("error", "Revise os equipamentos do contrato.")))
@@ -1277,7 +1479,7 @@ elif page == "Forecast Comercial":
                 else:
                     before = current.copy()
                     updates = {
-                        "Linha": e_line, "Competencia": comp_edit, "Cliente": e_cliente.strip(),
+                        "Linha": e_line, "Competencia": comp_edit, "Cliente": e_cliente_final,
                         "Tipo_Cliente": e_tipo_cliente, "Tipo_Receita": e_tipo_receita,
                         "Produto_Linha": e_produto.strip(), "Quantidade": float(e_qtd),
                         "Valor_Unitario": float(e_unit), **contract_updates,
