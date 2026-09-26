@@ -83,6 +83,14 @@ HISTORY_COLUMNS = [
     "Data_Hora", "Antes_JSON", "Depois_JSON",
 ]
 
+ACTIVE_CONTRACT_OVERRIDE_COLUMNS = [
+    "Contrato_Key", "Status_2027", "Meses_2027", "Valor_Mensal_Ajustado",
+    "Linha_Budget", "Observacao_2027", "Atualizado_Por", "Atualizado_Em",
+]
+ACTIVE_CONTRACT_STATUS = [
+    "REVISAR", "VALIDADO 12 MESES", "VIGENTE PARCIAL", "EM RENOVAÇÃO", "NÃO CONSIDERAR",
+]
+
 
 # =========================================================
 # VISUAL
@@ -302,6 +310,211 @@ def build_input_catalog(forecast_df: pd.DataFrame) -> dict[str, object]:
 
 def resolve_catalog_choice(selected: str, manual: str, new_option: str) -> str:
     return str(manual or "").strip() if selected == new_option else str(selected or "").strip()
+
+
+def _active_contracts_path() -> Path | None:
+    """Localiza a planilha operacional de contratos ativos no repositório do Budget."""
+    here = Path(__file__).resolve().parent
+    preferred = [
+        "PLANILHA DE CONTRATOS.xlsx",
+        "PLANILHA DE CONTRATOS.xlsm",
+        "Cópia de PLANILHA DE CONTRATOS - 25.09.26.xlsx",
+        "Copia de PLANILHA DE CONTRATOS - 25.09.26.xlsx",
+    ]
+    for name in preferred:
+        path = here / name
+        if path.exists() and not path.name.startswith("~$"):
+            return path
+    candidates = []
+    for path in here.glob("*.xls*"):
+        if path.name.startswith("~$"):
+            continue
+        key = norm(path.stem)
+        if "CONTRAT" in key and "BASE BI" not in key:
+            candidates.append(path)
+    if not candidates:
+        return None
+    return sorted(candidates, key=lambda p: p.stat().st_mtime_ns, reverse=True)[0]
+
+
+def _money_value(value: object) -> float:
+    if value is None or (isinstance(value, float) and np.isnan(value)):
+        return 0.0
+    if isinstance(value, (int, float, np.integer, np.floating)):
+        return float(value)
+    txt = str(value).strip().upper()
+    if txt in {"", "S/FAT", "S/ FAT", "SEM FAT", "SEM FATURAMENTO", "NAN", "NONE"}:
+        return 0.0
+    txt = txt.replace("R$", "").replace(" ", "")
+    if "," in txt:
+        txt = txt.replace(".", "").replace(",", ".")
+    try:
+        return float(txt)
+    except Exception:
+        return 0.0
+
+
+def _contract_budget_line(manager: object, product_line: object) -> str:
+    """Sugere a linha do Budget preservando os gestores oficiais do Intelligence."""
+    mgr = norm(manager)
+    prod = norm(product_line)
+    if "AMAURI" in mgr:
+        return "LOCACAO"
+    if "RONALDO" in mgr:
+        return "ENDOSCOPIA"
+    if "RENATO" in mgr:
+        return "VENDAS"
+    if "ENDOSCOP" in prod:
+        return "ENDOSCOPIA"
+    if "OXIGENO" in prod:
+        return "VENDAS"
+    if "AMAURI" in prod:
+        return "LOCACAO"
+    return "LOCACAO"
+
+
+@st.cache_data(show_spinner=False, ttl=300)
+def _read_active_contracts(path_text: str, modified_ns: int) -> dict[str, object]:
+    """Lê a carteira vigente e padroniza somente os campos necessários ao Budget."""
+    path = Path(path_text)
+    try:
+        book = pd.ExcelFile(path, engine="openpyxl")
+        sheet_name = "CT" if "CT" in book.sheet_names else book.sheet_names[0]
+        raw = pd.read_excel(path, sheet_name=sheet_name, engine="openpyxl")
+    except Exception as exc:
+        return {"data": pd.DataFrame(), "source": path.name, "warning": f"Não foi possível ler a planilha de contratos: {exc}"}
+
+    raw.columns = [str(c).strip() for c in raw.columns]
+    def col(candidates):
+        return _optional_col(raw, candidates)
+
+    mapping = {
+        "Numero_Contrato": col(["Nº CT", "N° CT", "NUMERO CT", "CONTRATO"]),
+        "Origem": col(["ORIGEM"]),
+        "SLA_Horas": col(["SLA EM HORAS", "SLA EM HORAS "]),
+        "Titulo_Card": col(["TITULO DO CARD", "TÍTULO DO CARD"]),
+        "Codigo_Cliente": col(["COD. CLIENTE", "COD CLIENTE", "CODIGO CLIENTE"]),
+        "Loja": col(["LOJA"]),
+        "CNPJ_CPF": col(["CNPJ/CPF", "CNPJ CPF"]),
+        "Cliente": col(["RAZÃO SOCIAL", "RAZAO SOCIAL", "CLIENTE"]),
+        "Data_Inicio": col(["INICIO", "INÍCIO"]),
+        "Valor_Mensal_Base": col(["VALOR FATURAMENTO", "VALOR FATURAMENTO ", "VALOR"]),
+        "Vendedor": col(["VENDEDOR"]),
+        "Gerente": col(["GERENTE"]),
+        "Linha_Produto": col(["LINHA DE PRODUTO", "LINHA PRODUTO"]),
+        "Dia_Faturamento": col(["DIA"]),
+        "Qtd_Equipamentos": col(["QTD EQ", "QTD. EQ", "QUANTIDADE EQUIPAMENTOS"]),
+    }
+
+    out = pd.DataFrame(index=raw.index)
+    for target, source in mapping.items():
+        out[target] = raw[source] if source else ""
+
+    # Descarta linhas separadoras/vazias sem contrato, cliente e CNPJ.
+    identity = (
+        out["Numero_Contrato"].fillna("").astype(str).str.strip()
+        + out["Cliente"].fillna("").astype(str).str.strip()
+        + out["CNPJ_CPF"].fillna("").astype(str).str.strip()
+    )
+    out = out.loc[identity.ne("")].copy()
+    out["Valor_Mensal_Base"] = out["Valor_Mensal_Base"].map(_money_value)
+    out["Data_Inicio"] = pd.to_datetime(out["Data_Inicio"], errors="coerce", dayfirst=True)
+    out["Qtd_Equipamentos"] = pd.to_numeric(out["Qtd_Equipamentos"], errors="coerce").fillna(0.0)
+    out["Linha_Sugerida"] = out.apply(lambda r: _contract_budget_line(r.get("Gerente"), r.get("Linha_Produto")), axis=1)
+    out["Fonte_Linha"] = np.where(out["Gerente"].fillna("").astype(str).str.strip().ne(""), "Gerente", "Linha de produto")
+    out["Linha_Fonte"] = np.arange(2, len(out) + 2)
+
+    # Chave estável sem usar valor mensal, permitindo reajuste do faturamento sem perder a revisão 2027.
+    def make_key(row):
+        raw_key = "|".join(norm(row.get(c, "")) for c in [
+            "Numero_Contrato", "Codigo_Cliente", "Loja", "CNPJ_CPF", "Cliente", "Gerente", "Linha_Produto"
+        ])
+        return hashlib.sha1(raw_key.encode("utf-8")).hexdigest()[:16].upper()
+    out["Contrato_Key"] = out.apply(make_key, axis=1)
+    out["Sem_Valor"] = out["Valor_Mensal_Base"].le(0)
+    return {"data": out.reset_index(drop=True), "source": path.name, "warning": ""}
+
+
+def active_contracts_source() -> dict[str, object]:
+    path = _active_contracts_path()
+    if path is None:
+        return {"data": pd.DataFrame(), "source": "", "warning": "Planilha de contratos ativos não localizada no repositório do Budget."}
+    return _read_active_contracts(str(path), path.stat().st_mtime_ns)
+
+
+def active_contract_overrides_file() -> str:
+    return f"carteira_ativa_{APP_YEAR}.csv"
+
+
+def load_active_contract_overrides() -> pd.DataFrame:
+    df = load_table(active_contract_overrides_file(), ACTIVE_CONTRACT_OVERRIDE_COLUMNS)
+    for col in ["Meses_2027", "Valor_Mensal_Ajustado"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    return df
+
+
+def build_active_contracts_budget() -> tuple[pd.DataFrame, dict[str, object]]:
+    """Combina a planilha operacional com as decisões de planejamento para 2027."""
+    source = active_contracts_source()
+    base = source.get("data", pd.DataFrame()).copy()
+    if base.empty:
+        return base, source
+    overrides = load_active_contract_overrides()
+    if not overrides.empty:
+        base = base.merge(overrides, on="Contrato_Key", how="left")
+    else:
+        for col in ACTIVE_CONTRACT_OVERRIDE_COLUMNS:
+            if col != "Contrato_Key":
+                base[col] = np.nan
+
+    base["Status_2027"] = base["Status_2027"].fillna("").astype(str).replace("", "REVISAR")
+    base["Linha_Budget"] = base["Linha_Budget"].fillna("").astype(str)
+    base.loc[base["Linha_Budget"].eq(""), "Linha_Budget"] = base.loc[base["Linha_Budget"].eq(""), "Linha_Sugerida"]
+    default_months = np.where(base["Valor_Mensal_Base"].gt(0), 12.0, 0.0)
+    base["Meses_2027"] = pd.to_numeric(base["Meses_2027"], errors="coerce")
+    base["Meses_2027"] = base["Meses_2027"].where(base["Meses_2027"].notna(), default_months).clip(0, 12)
+    base["Valor_Mensal_Ajustado"] = pd.to_numeric(base["Valor_Mensal_Ajustado"], errors="coerce")
+    base["Valor_Mensal_Ajustado"] = base["Valor_Mensal_Ajustado"].where(base["Valor_Mensal_Ajustado"].notna(), base["Valor_Mensal_Base"])
+    base["Observacao_2027"] = base["Observacao_2027"].fillna("").astype(str)
+    base["Receita_2027_Preliminar"] = base["Valor_Mensal_Base"] * np.where(base["Valor_Mensal_Base"].gt(0), 12, 0)
+    base["Receita_2027_Planejada"] = base["Valor_Mensal_Ajustado"] * base["Meses_2027"]
+    base.loc[base["Status_2027"].map(norm).eq("NAO CONSIDERAR"), "Receita_2027_Planejada"] = 0.0
+    base["Validado"] = ~base["Status_2027"].map(norm).eq("REVISAR")
+    base["Receita_2027_Validada"] = np.where(base["Validado"], base["Receita_2027_Planejada"], 0.0)
+    return base, source
+
+
+def save_active_contract_override(user: dict, row: pd.Series, status: str, months: int, monthly: float, line: str, note: str) -> None:
+    latest = load_active_contract_overrides()
+    key = str(row.get("Contrato_Key", ""))
+    payload = {
+        "Contrato_Key": key,
+        "Status_2027": status,
+        "Meses_2027": int(months),
+        "Valor_Mensal_Ajustado": float(monthly),
+        "Linha_Budget": norm(line),
+        "Observacao_2027": str(note or "").strip(),
+        "Atualizado_Por": user["nome"],
+        "Atualizado_Em": now_text(),
+    }
+    if latest.empty or not latest["Contrato_Key"].astype(str).eq(key).any():
+        latest = pd.concat([latest, pd.DataFrame([payload])], ignore_index=True)
+    else:
+        idx = latest.index[latest["Contrato_Key"].astype(str).eq(key)][0]
+        for k, v in payload.items():
+            latest.at[idx, k] = v
+    save_table(active_contract_overrides_file(), latest[ACTIVE_CONTRACT_OVERRIDE_COLUMNS], f"First Budget: revisão carteira {key}")
+
+
+def scope_active_contracts(df: pd.DataFrame, line: str) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame()
+    target_col = "Linha_Budget" if "Linha_Budget" in df.columns else "Linha_Sugerida"
+    if not is_director:
+        return df[df[target_col].astype(str).map(norm).eq(user["linha"])].copy()
+    if line != "CONSOLIDADO":
+        return df[df[target_col].astype(str).map(norm).eq(line)].copy()
+    return df.copy()
 
 
 def rental_projection(start_value: object, months_value: object, monthly_value: object) -> dict[str, object]:
@@ -836,6 +1049,7 @@ def rental_items_export(forecast: pd.DataFrame) -> pd.DataFrame:
 
 def export_excel(forecast: pd.DataFrame, history: pd.DataFrame) -> bytes:
     out = io.BytesIO()
+    itens_locacao_export = rental_items_export(forecast)
     f = forecast.copy()
     if not f.empty:
         f["Competência"] = f["Competencia"].map(month_label_from_comp)
@@ -957,7 +1171,7 @@ with st.sidebar:
         scope_choice = user["linha"]
         st.caption(f"Escopo: {line_label(scope_choice)}")
 
-    pages = ["Visão Geral", "Forecast Comercial", "Consolidação", "Histórico"]
+    pages = ["Visão Geral", "Carteira Ativa", "Forecast Comercial", "Consolidação", "Histórico"]
     page = st.radio("Navegação", pages, label_visibility="collapsed")
 
     cfg = storage_config()
@@ -978,6 +1192,16 @@ input_catalog = build_input_catalog(forecast)
 CLIENT_OPTIONS = list(input_catalog.get("clients", []))
 PRODUCT_OPTIONS = list(input_catalog.get("products", []))
 CLIENT_TYPES = dict(input_catalog.get("client_types", {}))
+active_contracts, active_contracts_meta = build_active_contracts_budget()
+if not active_contracts.empty:
+    contract_clients = [str(x).strip() for x in active_contracts["Cliente"].dropna().tolist() if str(x).strip()]
+    contract_products = [str(x).strip() for x in active_contracts["Linha_Produto"].dropna().tolist() if str(x).strip()]
+    CLIENT_OPTIONS = sorted({*CLIENT_OPTIONS, *contract_clients}, key=lambda x: norm(x))
+    PRODUCT_OPTIONS = sorted({*PRODUCT_OPTIONS, *contract_products}, key=lambda x: norm(x))
+    master_client_keys = {norm(x) for x in contract_clients}
+    for name in CLIENT_OPTIONS:
+        if norm(name) in master_client_keys:
+            CLIENT_TYPES[name] = "Atual"
 active_scope = scope_df(active, scope_choice)
 active_monthly = expand_monthly_forecast(active)
 active_monthly_scope = scope_df(active_monthly, scope_choice)
@@ -1032,6 +1256,130 @@ if page == "Visão Geral":
             fig2.add_trace(go.Bar(x=by_line["Linha_Label"], y=by_line["Ponderado"], name="Ponderado", marker_color=NAVY_2))
             fig2.update_layout(title="Forecast por linha de negócio", barmode="group")
             st.plotly_chart(plot_layout(fig2, 330), width="stretch", config={"displayModeBar": False})
+
+
+    section("Carteira ativa · base contratada")
+    carteira_scope = scope_active_contracts(active_contracts, scope_choice)
+    if carteira_scope.empty:
+        st.info("A planilha de contratos ativos ainda não foi localizada no repositório do Budget.")
+    else:
+        validada = float(carteira_scope["Receita_2027_Validada"].sum())
+        preliminar = float(carteira_scope["Receita_2027_Preliminar"].sum())
+        pendentes = int((carteira_scope["Status_2027"].astype(str).map(norm) == "REVISAR").sum())
+        sem_valor = int(carteira_scope["Valor_Mensal_Base"].le(0).sum())
+        a1, a2, a3, a4 = st.columns(4)
+        with a1:
+            kpi("Carteira validada", brl(validada), f"Receita base {APP_YEAR} revisada")
+        with a2:
+            kpi("Run-rate preliminar", brl(preliminar), "Valor mensal atual × 12 · antes da revisão")
+        with a3:
+            kpi("Contratos pendentes", f"{pendentes}", "Precisam validar meses/renovação")
+        with a4:
+            kpi("Sem valor mensal", f"{sem_valor}", "Não entram na receita até ajuste")
+        if pendentes:
+            st.caption("A carteira só entra como receita contratada validada após a revisão dos contratos. O arquivo fonte não possui data de término/vigência contratual.")
+
+
+# =========================================================
+# PÁGINA: CARTEIRA ATIVA
+# =========================================================
+elif page == "Carteira Ativa":
+    hero("Carteira Ativa 2027", "Contratos existentes formam a base da receita; o forecast comercial deve registrar somente expansão, renovação e novos negócios.")
+
+    source_name = str(active_contracts_meta.get("source", "") or "")
+    warning = str(active_contracts_meta.get("warning", "") or "")
+    if source_name:
+        st.caption(f"Fonte operacional: {source_name}")
+    if warning:
+        st.warning(warning)
+
+    carteira_scope = scope_active_contracts(active_contracts, scope_choice)
+    if carteira_scope.empty:
+        st.info("Inclua a planilha de contratos ativos no mesmo repositório do app para carregar a carteira automaticamente.")
+    else:
+        monthly_runrate = float(carteira_scope["Valor_Mensal_Base"].sum())
+        preliminar = float(carteira_scope["Receita_2027_Preliminar"].sum())
+        validada = float(carteira_scope["Receita_2027_Validada"].sum())
+        pendentes = int((carteira_scope["Status_2027"].astype(str).map(norm) == "REVISAR").sum())
+        sem_valor = int(carteira_scope["Valor_Mensal_Base"].le(0).sum())
+
+        c1, c2, c3, c4, c5 = st.columns(5)
+        with c1:
+            kpi("Contratos / linhas", f"{len(carteira_scope)}", "Registros da carteira vigente")
+        with c2:
+            kpi("Faturamento mensal", brl(monthly_runrate), "Somatório dos valores mensais informados")
+        with c3:
+            kpi("Run-rate 2027", brl(preliminar), "Hipótese inicial: 12 meses")
+        with c4:
+            kpi("Base validada", brl(validada), "Somente contratos revisados")
+        with c5:
+            kpi("Pendentes", f"{pendentes}", f"{sem_valor} sem valor mensal")
+
+        st.markdown(
+            "<div class='storage-note'><b>Importante:</b> esta planilha informa início e valor de faturamento, mas não traz uma data de término/vigência do contrato. Por isso, o sistema usa 12 meses apenas como <b>run-rate preliminar</b>. A receita oficial do Budget deve usar a coluna <b>Base validada</b>, após informar quantos meses o contrato permanecerá em 2027.</div>",
+            unsafe_allow_html=True,
+        )
+
+        section("Revisão da carteira para 2027")
+        if is_controladoria:
+            selector = carteira_scope.copy()
+            selector["_label"] = selector.apply(
+                lambda r: f"{str(r.get('Numero_Contrato','')).strip() or 'Sem nº'} · {str(r.get('Cliente','')).strip()} · {str(r.get('Linha_Produto','')).strip() or str(r.get('Gerente','')).strip()} · {brl(r.get('Valor_Mensal_Base',0))}/mês",
+                axis=1,
+            )
+            labels = selector["_label"].tolist()
+            selected_label = st.selectbox("Contrato / linha para revisar", labels)
+            selected_row = selector.loc[selector["_label"].eq(selected_label)].iloc[0]
+            current_status = str(selected_row.get("Status_2027", "REVISAR"))
+            status_index = ACTIVE_CONTRACT_STATUS.index(current_status) if current_status in ACTIVE_CONTRACT_STATUS else 0
+            current_line = norm(selected_row.get("Linha_Budget", selected_row.get("Linha_Sugerida", "LOCACAO")))
+            line_index = LINES.index(current_line) if current_line in LINES else LINES.index("LOCACAO")
+            with st.form("active_contract_review_form"):
+                r1, r2, r3, r4 = st.columns([1.25, .85, 1, 1])
+                with r1:
+                    status_2027 = st.selectbox("Tratamento 2027", ACTIVE_CONTRACT_STATUS, index=status_index)
+                with r2:
+                    meses_2027 = st.number_input("Meses em 2027", min_value=0, max_value=12, value=int(float(selected_row.get("Meses_2027", 12) or 0)), step=1)
+                with r3:
+                    valor_mensal_ajustado = st.number_input(
+                        "Valor mensal 2027", min_value=0.0,
+                        value=float(selected_row.get("Valor_Mensal_Ajustado", 0) or 0), step=100.0, format="%.2f",
+                    )
+                with r4:
+                    linha_budget = st.selectbox("Linha Budget", LINES, index=line_index, format_func=line_label)
+                obs_2027 = st.text_area("Observação / renovação / encerramento previsto", value=str(selected_row.get("Observacao_2027", "") or ""), height=80)
+                save_review = st.form_submit_button("Salvar revisão da carteira", width="stretch")
+            if save_review:
+                try:
+                    save_active_contract_override(user, selected_row, status_2027, int(meses_2027), float(valor_mensal_ajustado), linha_budget, obs_2027)
+                    st.success("Contrato revisado para o Budget 2027.")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Não foi possível salvar a revisão: {exc}")
+        else:
+            st.caption("A revisão da carteira é feita pela Controladoria. Seu perfil visualiza os contratos da respectiva linha.")
+
+        section("Contratos existentes")
+        view = carteira_scope.copy()
+        view["Contrato"] = view["Numero_Contrato"].fillna("").astype(str)
+        view["Cliente"] = view["Cliente"].fillna("").astype(str)
+        view["Início"] = view["Data_Inicio"].map(date_br)
+        view["Linha"] = view["Linha_Budget"].map(line_label)
+        view["Valor mensal"] = view["Valor_Mensal_Ajustado"]
+        view["Receita 2027"] = view["Receita_2027_Planejada"]
+        view["Status"] = view["Status_2027"]
+        view["Meses"] = view["Meses_2027"].astype(int)
+        view["Produto / linha"] = view["Linha_Produto"].fillna("").astype(str)
+        view["Qtd. eq."] = view["Qtd_Equipamentos"]
+        display_cols = ["Contrato", "Cliente", "Linha", "Produto / linha", "Início", "Valor mensal", "Meses", "Receita 2027", "Status", "Qtd. eq."]
+        st.dataframe(
+            view[display_cols], hide_index=True, width="stretch",
+            column_config={
+                "Valor mensal": st.column_config.NumberColumn(format="R$ %.2f"),
+                "Receita 2027": st.column_config.NumberColumn(format="R$ %.2f"),
+                "Qtd. eq.": st.column_config.NumberColumn(format="%.0f"),
+            },
+        )
 
 
 # =========================================================
