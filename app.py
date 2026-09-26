@@ -68,13 +68,14 @@ PROBABILITY_WEIGHTS = {"Alta": 0.90, "Média": 0.60, "Baixa": 0.30}
 
 FORECAST_COLUMNS = [
     "ID", "Ano", "Linha", "Competencia", "Cliente", "Tipo_Cliente",
-    "Tipo_Receita", "Produto_Linha", "Quantidade", "Valor_Unitario",
-    "Data_Inicio_Contrato", "Prazo_Contrato_Meses", "Data_Fim_Contrato",
-    "Valor_Mensal_Contrato", "Receita_Contrato_Total", "Meses_No_Ano",
+    "Tipo_Receita", "Produto_Linha", "Numero_Contrato", "Itens_Contrato_JSON",
+    "Quantidade", "Valor_Unitario", "Data_Inicio_Contrato", "Prazo_Contrato_Meses",
+    "Data_Fim_Contrato", "Valor_Mensal_Contrato", "Receita_Contrato_Total", "Meses_No_Ano",
     "Receita_Prevista", "Probabilidade", "Peso_Probabilidade",
     "Receita_Ponderada", "Observacao", "Status", "Criado_Por",
     "Criado_Em", "Atualizado_Por", "Atualizado_Em",
 ]
+CONTRACT_ITEM_COLUMNS = ["Equipamento", "Quantidade", "Valor_Mensal_Unitario", "Observacao_Item"]
 HISTORY_COLUMNS = [
     "Historico_ID", "Forecast_ID", "Ano", "Linha", "Acao", "Usuario",
     "Data_Hora", "Antes_JSON", "Depois_JSON",
@@ -203,6 +204,96 @@ def rental_projection(start_value: object, months_value: object, monthly_value: 
         "end": end,
         "first_comp": first_comp,
     }
+
+
+def contract_items_from_row(row: dict | pd.Series) -> pd.DataFrame:
+    """Lê os itens de um contrato e mantém compatibilidade com locações criadas na versão anterior."""
+    raw = str(row.get("Itens_Contrato_JSON", "") or "").strip()
+    if raw:
+        try:
+            payload = json.loads(raw)
+            if isinstance(payload, list):
+                frame = pd.DataFrame(payload)
+                for col in CONTRACT_ITEM_COLUMNS:
+                    if col not in frame.columns:
+                        frame[col] = "" if col in {"Equipamento", "Observacao_Item"} else 0.0
+                frame["Quantidade"] = pd.to_numeric(frame["Quantidade"], errors="coerce").fillna(0.0)
+                frame["Valor_Mensal_Unitario"] = pd.to_numeric(frame["Valor_Mensal_Unitario"], errors="coerce").fillna(0.0)
+                return frame[CONTRACT_ITEM_COLUMNS].copy()
+        except Exception:
+            pass
+
+    # Compatibilidade: na versão anterior Valor_Mensal_Contrato era o total mensal do contrato.
+    if norm(row.get("Tipo_Receita")) == "LOCACAO":
+        monthly_total = float(pd.to_numeric(pd.Series([row.get("Valor_Mensal_Contrato")]), errors="coerce").fillna(0).iloc[0])
+        qty = float(pd.to_numeric(pd.Series([row.get("Quantidade")]), errors="coerce").fillna(0).iloc[0])
+        qty = qty if qty > 0 else 1.0
+        equipment = str(row.get("Produto_Linha", "") or "").strip() or "Equipamento"
+        if monthly_total > 0:
+            return pd.DataFrame([{
+                "Equipamento": equipment,
+                "Quantidade": qty,
+                "Valor_Mensal_Unitario": monthly_total / qty,
+                "Observacao_Item": "",
+            }], columns=CONTRACT_ITEM_COLUMNS)
+    return pd.DataFrame(columns=CONTRACT_ITEM_COLUMNS)
+
+
+def contract_items_metrics(editor_value: object) -> dict[str, object]:
+    """Valida a grade de equipamentos e calcula quantidade e mensalidade total do contrato."""
+    frame = pd.DataFrame(editor_value).copy() if editor_value is not None else pd.DataFrame(columns=CONTRACT_ITEM_COLUMNS)
+    for col in CONTRACT_ITEM_COLUMNS:
+        if col not in frame.columns:
+            frame[col] = "" if col in {"Equipamento", "Observacao_Item"} else 0.0
+    frame = frame[CONTRACT_ITEM_COLUMNS].copy()
+    frame["Equipamento"] = frame["Equipamento"].fillna("").astype(str).str.strip()
+    frame["Observacao_Item"] = frame["Observacao_Item"].fillna("").astype(str).str.strip()
+    frame["Quantidade"] = pd.to_numeric(frame["Quantidade"], errors="coerce").fillna(0.0)
+    frame["Valor_Mensal_Unitario"] = pd.to_numeric(frame["Valor_Mensal_Unitario"], errors="coerce").fillna(0.0)
+
+    # Remove apenas linhas totalmente vazias; linhas parcialmente preenchidas devem gerar validação.
+    blank = (frame["Equipamento"].eq("") & frame["Quantidade"].eq(0) & frame["Valor_Mensal_Unitario"].eq(0) & frame["Observacao_Item"].eq(""))
+    frame = frame.loc[~blank].reset_index(drop=True)
+    if frame.empty:
+        return {"valid": False, "error": "Inclua pelo menos um equipamento no contrato.", "df": frame}
+    if frame["Equipamento"].eq("").any():
+        return {"valid": False, "error": "Informe o equipamento em todas as linhas do contrato.", "df": frame}
+    if frame["Quantidade"].le(0).any():
+        return {"valid": False, "error": "A quantidade de cada equipamento deve ser maior que zero.", "df": frame}
+    if frame["Valor_Mensal_Unitario"].le(0).any():
+        return {"valid": False, "error": "Informe um valor mensal unitário maior que zero para cada equipamento.", "df": frame}
+
+    frame["Valor_Mensal_Total"] = frame["Quantidade"] * frame["Valor_Mensal_Unitario"]
+    records = []
+    for _, item in frame.iterrows():
+        records.append({
+            "Equipamento": item["Equipamento"],
+            "Quantidade": float(item["Quantidade"]),
+            "Valor_Mensal_Unitario": float(item["Valor_Mensal_Unitario"]),
+            "Valor_Mensal_Total": float(item["Valor_Mensal_Total"]),
+            "Observacao_Item": item["Observacao_Item"],
+        })
+    names = frame["Equipamento"].tolist()
+    summary = "; ".join(names[:3])
+    if len(names) > 3:
+        summary += f" +{len(names) - 3} item(ns)"
+    return {
+        "valid": True,
+        "error": "",
+        "df": frame,
+        "item_count": int(len(frame)),
+        "total_units": float(frame["Quantidade"].sum()),
+        "monthly_total": float(frame["Valor_Mensal_Total"].sum()),
+        "summary": summary,
+        "json": json.dumps(records, ensure_ascii=False),
+    }
+
+
+def contract_item_count(row: dict | pd.Series) -> int:
+    try:
+        return int(len(contract_items_from_row(row)))
+    except Exception:
+        return 0
 
 
 def forecast_period_label(row: pd.Series) -> str:
@@ -581,6 +672,38 @@ def commit_forecast(action: str, user: dict, forecast_id: str, line: str, before
 # =========================================================
 # EXPORTAÇÃO
 # =========================================================
+def rental_items_export(forecast: pd.DataFrame) -> pd.DataFrame:
+    rows: list[dict] = []
+    if forecast is None or forecast.empty:
+        return pd.DataFrame()
+    rental = forecast[forecast["Tipo_Receita"].astype(str).map(norm).eq("LOCACAO")].copy()
+    for _, contract in rental.iterrows():
+        items = contract_items_from_row(contract)
+        months_in_year = int(float(contract.get("Meses_No_Ano", 0) or 0))
+        term = int(float(contract.get("Prazo_Contrato_Meses", 0) or 0))
+        for _, item in items.iterrows():
+            qty = float(item.get("Quantidade", 0) or 0)
+            unit = float(item.get("Valor_Mensal_Unitario", 0) or 0)
+            monthly = qty * unit
+            rows.append({
+                "Forecast ID": contract.get("ID", ""),
+                "Linha": line_label(str(contract.get("Linha", ""))),
+                "Cliente": contract.get("Cliente", ""),
+                "Contrato": contract.get("Numero_Contrato", ""),
+                "Início": date_br(contract.get("Data_Inicio_Contrato", "")),
+                "Fim": date_br(contract.get("Data_Fim_Contrato", "")),
+                "Prazo (meses)": term,
+                "Equipamento": item.get("Equipamento", ""),
+                "Quantidade": qty,
+                "Valor mensal unitário": unit,
+                "Valor mensal item": monthly,
+                f"Forecast item {APP_YEAR}": monthly * months_in_year,
+                "Valor item contrato": monthly * term,
+                "Observação do item": item.get("Observacao_Item", ""),
+            })
+    return pd.DataFrame(rows)
+
+
 def export_excel(forecast: pd.DataFrame, history: pd.DataFrame) -> bytes:
     out = io.BytesIO()
     f = forecast.copy()
@@ -589,8 +712,11 @@ def export_excel(forecast: pd.DataFrame, history: pd.DataFrame) -> bytes:
         f["Linha"] = f["Linha"].map(line_label)
         f["Início Contrato"] = f["Data_Inicio_Contrato"].map(date_br)
         f["Fim Contrato"] = f["Data_Fim_Contrato"].map(date_br)
+        f["Qtd Itens Contrato"] = forecast.apply(contract_item_count, axis=1).values
         for col in ["Valor_Unitario", "Valor_Mensal_Contrato", "Receita_Contrato_Total", "Receita_Prevista", "Receita_Ponderada"]:
             f[col] = pd.to_numeric(f[col], errors="coerce").fillna(0)
+        if "Itens_Contrato_JSON" in f.columns:
+            f = f.drop(columns=["Itens_Contrato_JSON"])
 
     active_raw = forecast[forecast["Status"].astype(str).str.upper().eq("ATIVO")].copy() if not forecast.empty else forecast.copy()
     active_monthly = expand_monthly_forecast(active_raw)
@@ -627,13 +753,14 @@ def export_excel(forecast: pd.DataFrame, history: pd.DataFrame) -> bytes:
     with pd.ExcelWriter(out, engine="xlsxwriter") as writer:
         f.to_excel(writer, index=False, sheet_name="Forecast")
         mensal_detalhe.to_excel(writer, index=False, sheet_name="Projeção Mensal")
+        itens_locacao_export.to_excel(writer, index=False, sheet_name="Itens Locação")
         resumo_linha.to_excel(writer, index=False, sheet_name="Resumo Linha")
         resumo_mes.to_excel(writer, index=False, sheet_name="Resumo Mensal")
         history.to_excel(writer, index=False, sheet_name="Histórico")
         wb = writer.book
         header = wb.add_format({"bold": True, "font_color": "white", "bg_color": NAVY})
         money = wb.add_format({"num_format": 'R$ #,##0.00;[Red]-R$ #,##0.00'})
-        frames = [("Forecast", f), ("Projeção Mensal", mensal_detalhe), ("Resumo Linha", resumo_linha), ("Resumo Mensal", resumo_mes), ("Histórico", history)]
+        frames = [("Forecast", f), ("Projeção Mensal", mensal_detalhe), ("Itens Locação", itens_locacao_export), ("Resumo Linha", resumo_linha), ("Resumo Mensal", resumo_mes), ("Histórico", history)]
         for ws_name, frame in frames:
             ws = writer.sheets[ws_name]
             for idx, col in enumerate(frame.columns):
@@ -788,7 +915,7 @@ elif page == "Forecast Comercial":
             index=default_rev_idx,
             horizontal=True,
             key="new_revenue_type",
-            help="Na locação, informe início, prazo e valor mensal. O sistema distribui a receita nas competências de 2027.",
+            help="Na locação, informe início, prazo e os equipamentos. O sistema soma as mensalidades dos itens e distribui a receita nas competências de 2027.",
         )
 
         with st.form("new_forecast_form", clear_on_submit=True):
@@ -812,13 +939,32 @@ elif page == "Forecast Comercial":
                         format="DD/MM/YYYY",
                     )
                     prazo_contrato = st.number_input("Prazo do contrato (meses)", min_value=1, max_value=120, value=12, step=1)
-                    produto = st.text_input("Equipamento / linha / oportunidade")
                 with c:
-                    valor_mensal = st.number_input("Valor mensal da locação", min_value=0.0, value=0.0, step=1000.0, format="%.2f")
-                    quantidade = st.number_input("Quantidade de equipamentos", min_value=0.0, value=1.0, step=1.0)
-                    st.caption("A receita de 2027 será calculada pelos meses de vigência que pertencem ao ano do orçamento.")
+                    numero_contrato = st.text_input("Nº / referência do contrato", help="Opcional no forecast. Pode ser preenchido quando o contrato estiver definido.")
+                    st.caption("O mesmo contrato pode conter vários equipamentos. A receita mensal será a soma de todos os itens.")
+
+                st.markdown("**Equipamentos do contrato**")
+                itens_locacao = st.data_editor(
+                    pd.DataFrame([{
+                        "Equipamento": "", "Quantidade": 1.0, "Valor_Mensal_Unitario": 0.0, "Observacao_Item": ""
+                    }], columns=CONTRACT_ITEM_COLUMNS),
+                    num_rows="dynamic",
+                    hide_index=True,
+                    width="stretch",
+                    key="new_rental_items",
+                    column_config={
+                        "Equipamento": st.column_config.TextColumn("Equipamento / produto *", required=True),
+                        "Quantidade": st.column_config.NumberColumn("Qtd. *", min_value=0.0, step=1.0, format="%.0f"),
+                        "Valor_Mensal_Unitario": st.column_config.NumberColumn("Valor mensal unit. *", min_value=0.0, step=100.0, format="R$ %.2f"),
+                        "Observacao_Item": st.column_config.TextColumn("Observação do item"),
+                    },
+                )
+                st.caption("Use o botão + da tabela para adicionar outros equipamentos ao mesmo contrato.")
                 competencia = ""
-                valor_unitario = float(valor_mensal)
+                produto = ""
+                quantidade = 0.0
+                valor_unitario = 0.0
+                valor_mensal = 0.0
                 valor_previsto = 0.0
             else:
                 with b:
@@ -841,6 +987,8 @@ elif page == "Forecast Comercial":
                     )
                 inicio_contrato = None
                 prazo_contrato = 0
+                numero_contrato = ""
+                itens_locacao = pd.DataFrame(columns=CONTRACT_ITEM_COLUMNS)
                 valor_mensal = 0.0
 
             d, e = st.columns([1, 2])
@@ -862,11 +1010,16 @@ elif page == "Forecast Comercial":
                 "Meses_No_Ano": 0,
             }
 
+            item_metrics = {"valid": True, "error": "", "item_count": 0, "total_units": float(quantidade), "monthly_total": 0.0, "summary": produto.strip(), "json": ""}
             if new_revenue_type == "Locação":
+                item_metrics = contract_items_metrics(itens_locacao)
+                valor_mensal = float(item_metrics.get("monthly_total", 0.0)) if item_metrics.get("valid") else 0.0
                 proj = rental_projection(inicio_contrato, prazo_contrato, valor_mensal)
                 receita = float(proj["revenue_year"])
                 competencia_final = str(proj["first_comp"])
                 contract_data = {
+                    "Numero_Contrato": numero_contrato.strip(),
+                    "Itens_Contrato_JSON": str(item_metrics.get("json", "")),
                     "Data_Inicio_Contrato": pd.Timestamp(inicio_contrato).strftime("%Y-%m-%d"),
                     "Prazo_Contrato_Meses": int(prazo_contrato),
                     "Data_Fim_Contrato": pd.Timestamp(proj["end"]).strftime("%Y-%m-%d") if proj["end"] is not None else "",
@@ -874,12 +1027,19 @@ elif page == "Forecast Comercial":
                     "Receita_Contrato_Total": float(proj["contract_total"]),
                     "Meses_No_Ano": int(proj["months_in_year"]),
                 }
+                produto = str(item_metrics.get("summary", ""))
+                quantidade = float(item_metrics.get("total_units", 0.0))
+                valor_unitario = 0.0
             else:
+                contract_data["Numero_Contrato"] = ""
+                contract_data["Itens_Contrato_JSON"] = ""
                 receita = float(valor_previsto) if float(valor_previsto) > 0 else float(quantidade) * float(valor_unitario)
                 competencia_final = competencia
 
             if not cliente_clean:
                 st.error("Informe o cliente.")
+            elif new_revenue_type == "Locação" and not item_metrics.get("valid"):
+                st.error(str(item_metrics.get("error", "Revise os equipamentos do contrato.")))
             elif new_revenue_type == "Locação" and contract_data["Meses_No_Ano"] <= 0:
                 st.error(f"A vigência informada não possui receita dentro de {APP_YEAR}.")
             elif receita <= 0:
@@ -913,8 +1073,9 @@ elif page == "Forecast Comercial":
                     commit_forecast("INCLUSÃO", user, fid, new_line, None, row)
                     if new_revenue_type == "Locação":
                         st.success(
-                            f"Locação incluída. Receita projetada em {APP_YEAR}: {brl(receita)} · "
-                            f"{contract_data['Meses_No_Ano']} competência(s)."
+                            f"Locação incluída com {item_metrics.get('item_count', 0)} item(ns). "
+                            f"Mensalidade total: {brl(contract_data['Valor_Mensal_Contrato'])} · "
+                            f"Forecast {APP_YEAR}: {brl(receita)} · {contract_data['Meses_No_Ano']} competência(s)."
                         )
                     else:
                         st.success("Forecast incluído com sucesso.")
@@ -950,21 +1111,22 @@ elif page == "Forecast Comercial":
         st.info("Nenhum forecast encontrado para os filtros selecionados.")
     else:
         show = view[[
-            "ID", "Linha", "Competencia", "Cliente", "Tipo_Cliente", "Tipo_Receita", "Produto_Linha",
+            "ID", "Linha", "Competencia", "Cliente", "Tipo_Cliente", "Tipo_Receita", "Produto_Linha", "Numero_Contrato",
             "Data_Inicio_Contrato", "Data_Fim_Contrato", "Prazo_Contrato_Meses", "Valor_Mensal_Contrato",
             "Receita_Prevista", "Probabilidade", "Receita_Ponderada", "Atualizado_Por", "Atualizado_Em"
         ]].copy()
+        show["Qtd. itens"] = view.apply(contract_item_count, axis=1)
         show["Linha"] = show["Linha"].map(line_label)
         show["Mês / Vigência"] = show.apply(forecast_period_label, axis=1)
         show = show.drop(columns=["Competencia", "Data_Inicio_Contrato", "Data_Fim_Contrato", "Prazo_Contrato_Meses"])
         show = show.rename(columns={
-            "Tipo_Cliente": "Tipo cliente", "Tipo_Receita": "Receita",
-            "Produto_Linha": "Produto / Oportunidade", "Valor_Mensal_Contrato": "Valor mensal",
+            "Tipo_Cliente": "Tipo cliente", "Tipo_Receita": "Receita", "Numero_Contrato": "Contrato",
+            "Produto_Linha": "Itens / Oportunidade", "Valor_Mensal_Contrato": "Valor mensal",
             "Receita_Prevista": f"Forecast {APP_YEAR}", "Receita_Ponderada": "Forecast Ponderado",
             "Atualizado_Por": "Atualizado por", "Atualizado_Em": "Atualizado em",
         })
         ordered = [
-            "ID", "Linha", "Mês / Vigência", "Cliente", "Tipo cliente", "Receita", "Produto / Oportunidade",
+            "ID", "Linha", "Mês / Vigência", "Cliente", "Tipo cliente", "Receita", "Contrato", "Qtd. itens", "Itens / Oportunidade",
             "Valor mensal", f"Forecast {APP_YEAR}", "Probabilidade", "Forecast Ponderado", "Atualizado por", "Atualizado em"
         ]
         st.dataframe(
@@ -1016,19 +1178,38 @@ elif page == "Forecast Comercial":
                     old_term = int(float(current.get("Prazo_Contrato_Meses") or 0))
                     if old_term <= 0:
                         old_term = 1
-                    old_monthly = float(current.get("Valor_Mensal_Contrato") or 0)
-                    if old_monthly <= 0:
-                        old_monthly = float(current.get("Receita_Prevista") or 0)
                     with b:
                         e_inicio = st.date_input("Início do contrato", value=old_start.date(), min_value=date(APP_YEAR - 7, 1, 1), max_value=date(APP_YEAR, 12, 31), format="DD/MM/YYYY")
                         e_prazo = st.number_input("Prazo do contrato (meses)", min_value=1, max_value=120, value=old_term, step=1)
-                        e_produto = st.text_input("Equipamento / linha / oportunidade", value=str(current["Produto_Linha"]))
                     with c:
-                        e_monthly = st.number_input("Valor mensal da locação", min_value=0.0, value=old_monthly, step=1000.0, format="%.2f")
-                        e_qtd = st.number_input("Quantidade de equipamentos", min_value=0.0, value=float(current["Quantidade"] or 0), step=1.0)
-                        st.caption("A alteração recalcula automaticamente todas as competências de 2027 cobertas pelo contrato.")
+                        e_numero_contrato = st.text_input("Nº / referência do contrato", value=str(current.get("Numero_Contrato", "") or ""))
+                        st.caption("Edite os itens abaixo. A mensalidade total é recalculada pela soma dos equipamentos.")
+
+                    st.markdown("**Equipamentos do contrato**")
+                    legacy_items = contract_items_from_row(current)
+                    if legacy_items.empty:
+                        legacy_items = pd.DataFrame([{
+                            "Equipamento": "", "Quantidade": 1.0, "Valor_Mensal_Unitario": 0.0, "Observacao_Item": ""
+                        }], columns=CONTRACT_ITEM_COLUMNS)
+                    e_items = st.data_editor(
+                        legacy_items,
+                        num_rows="dynamic",
+                        hide_index=True,
+                        width="stretch",
+                        key=f"edit_rental_items_{edit_id}",
+                        column_config={
+                            "Equipamento": st.column_config.TextColumn("Equipamento / produto *", required=True),
+                            "Quantidade": st.column_config.NumberColumn("Qtd. *", min_value=0.0, step=1.0, format="%.0f"),
+                            "Valor_Mensal_Unitario": st.column_config.NumberColumn("Valor mensal unit. *", min_value=0.0, step=100.0, format="R$ %.2f"),
+                            "Observacao_Item": st.column_config.TextColumn("Observação do item"),
+                        },
+                    )
+                    st.caption("Use + para incluir outro equipamento ou exclua uma linha da grade para removê-lo do contrato.")
                     e_comp = ""
-                    e_unit = e_monthly
+                    e_produto = ""
+                    e_qtd = 0.0
+                    e_unit = 0.0
+                    e_monthly = 0.0
                     e_receita = 0.0
                 else:
                     with b:
@@ -1042,6 +1223,8 @@ elif page == "Forecast Comercial":
                         e_receita = st.number_input("Receita prevista", min_value=0.0, value=float(current["Receita_Prevista"] or 0), step=1000.0, format="%.2f")
                     e_inicio = None
                     e_prazo = 0
+                    e_numero_contrato = ""
+                    e_items = pd.DataFrame(columns=CONTRACT_ITEM_COLUMNS)
                     e_monthly = 0.0
 
                 d, e = st.columns([1, 2])
@@ -1055,14 +1238,23 @@ elif page == "Forecast Comercial":
             if update_btn:
                 peso = PROBABILITY_WEIGHTS[e_prob]
                 contract_updates = {
+                    "Numero_Contrato": "", "Itens_Contrato_JSON": "",
                     "Data_Inicio_Contrato": "", "Prazo_Contrato_Meses": 0, "Data_Fim_Contrato": "",
                     "Valor_Mensal_Contrato": 0.0, "Receita_Contrato_Total": 0.0, "Meses_No_Ano": 0,
                 }
+                edit_item_metrics = {"valid": True, "error": "", "total_units": float(e_qtd), "summary": e_produto.strip(), "json": ""}
                 if e_tipo_receita == "Locação":
+                    edit_item_metrics = contract_items_metrics(e_items)
+                    e_monthly = float(edit_item_metrics.get("monthly_total", 0.0)) if edit_item_metrics.get("valid") else 0.0
+                    e_qtd = float(edit_item_metrics.get("total_units", 0.0)) if edit_item_metrics.get("valid") else 0.0
+                    e_produto = str(edit_item_metrics.get("summary", "")) if edit_item_metrics.get("valid") else ""
+                    e_unit = 0.0
                     proj = rental_projection(e_inicio, e_prazo, e_monthly)
                     receita_edit = float(proj["revenue_year"])
                     comp_edit = str(proj["first_comp"])
                     contract_updates = {
+                        "Numero_Contrato": e_numero_contrato.strip(),
+                        "Itens_Contrato_JSON": str(edit_item_metrics.get("json", "")),
                         "Data_Inicio_Contrato": pd.Timestamp(e_inicio).strftime("%Y-%m-%d"),
                         "Prazo_Contrato_Meses": int(e_prazo),
                         "Data_Fim_Contrato": pd.Timestamp(proj["end"]).strftime("%Y-%m-%d") if proj["end"] is not None else "",
@@ -1076,6 +1268,8 @@ elif page == "Forecast Comercial":
 
                 if not e_cliente.strip():
                     st.error("Informe o cliente.")
+                elif e_tipo_receita == "Locação" and not edit_item_metrics.get("valid"):
+                    st.error(str(edit_item_metrics.get("error", "Revise os equipamentos do contrato.")))
                 elif e_tipo_receita == "Locação" and contract_updates["Meses_No_Ano"] <= 0:
                     st.error(f"A vigência informada não possui receita dentro de {APP_YEAR}.")
                 elif receita_edit <= 0:
