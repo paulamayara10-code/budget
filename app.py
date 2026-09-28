@@ -83,14 +83,6 @@ HISTORY_COLUMNS = [
     "Data_Hora", "Antes_JSON", "Depois_JSON",
 ]
 
-ACTIVE_CONTRACT_OVERRIDE_COLUMNS = [
-    "Contrato_Key", "Status_2027", "Meses_2027", "Valor_Mensal_Ajustado",
-    "Linha_Budget", "Observacao_2027", "Atualizado_Por", "Atualizado_Em",
-]
-ACTIVE_CONTRACT_STATUS = [
-    "REVISAR", "VALIDADO 12 MESES", "VIGENTE PARCIAL", "EM RENOVAÇÃO", "NÃO CONSIDERAR",
-]
-
 
 # =========================================================
 # VISUAL
@@ -126,10 +118,16 @@ st.markdown(
     .hero p {{ margin:0; opacity:.82; font-size:.87rem; }}
     .hero .eyebrow {{ font-size:.70rem; font-weight:900; letter-spacing:.24em; color:#B9D9F0; text-transform:uppercase; }}
 
-    .kpi {{ background:#FFFFFF; border:1px solid {BORDER}; border-radius:17px; padding:13px 14px; min-height:105px; box-shadow:0 8px 22px rgba(7,27,51,.045); }}
-    .kpi .label {{ color:{GRAY}; font-size:.68rem; font-weight:900; letter-spacing:.05em; text-transform:uppercase; }}
-    .kpi .value {{ color:{NAVY}; font-size:1.35rem; font-weight:950; margin-top:10px; white-space:nowrap; }}
-    .kpi .note {{ color:{GRAY}; font-size:.72rem; margin-top:8px; line-height:1.35; }}
+    .kpi {{
+        position:relative; overflow:hidden; background:linear-gradient(145deg,#FFFFFF 0%,#FBFDFF 100%);
+        border:1px solid #C9DDED; border-radius:19px; padding:17px 17px 15px; min-height:132px;
+        box-shadow:0 10px 26px rgba(7,27,51,.075); display:flex; flex-direction:column; justify-content:space-between;
+    }}
+    .kpi::before {{ content:""; position:absolute; left:0; top:0; bottom:0; width:5px; background:{BLUE}; }}
+    .kpi::after {{ content:""; position:absolute; width:82px; height:82px; border-radius:50%; right:-30px; top:-34px; background:rgba(79,154,209,.10); }}
+    .kpi .label {{ color:#52677D; font-size:.74rem; font-weight:950; letter-spacing:.055em; text-transform:uppercase; line-height:1.28; padding-left:2px; }}
+    .kpi .value {{ color:{NAVY}; font-size:clamp(1.22rem,1.62vw,1.72rem); font-weight:950; line-height:1.08; margin-top:12px; white-space:normal; overflow-wrap:anywhere; letter-spacing:-.025em; }}
+    .kpi .note {{ color:#667085; font-size:.76rem; margin-top:10px; line-height:1.42; }}
 
     .section {{ color:{NAVY}; font-size:1.08rem; font-weight:900; margin:15px 0 7px; padding-bottom:7px; border-bottom:1px solid {BORDER}; }}
     .pill {{ display:inline-flex; align-items:center; border-radius:999px; padding:5px 9px; background:#EAF3FA; color:{BLUE}; font-size:.68rem; font-weight:900; }}
@@ -398,6 +396,8 @@ def _read_active_contracts(path_text: str, modified_ns: int) -> dict[str, object
         "CNPJ_CPF": col(["CNPJ/CPF", "CNPJ CPF"]),
         "Cliente": col(["RAZÃO SOCIAL", "RAZAO SOCIAL", "CLIENTE"]),
         "Data_Inicio": col(["INICIO", "INÍCIO"]),
+        "Data_Fim": col(["FIM", "TÉRMINO", "TERMINO", "VENCIMENTO", "DATA FIM", "DATA TÉRMINO", "DATA TERMINO"]),
+        "Meses_2027_Base": col(["MESES 2027", "MESES_2027", "QTD MESES 2027", "QTD. MESES 2027"]),
         "Valor_Mensal_Base": col(["VALOR FATURAMENTO", "VALOR FATURAMENTO ", "VALOR"]),
         "Vendedor": col(["VENDEDOR"]),
         "Gerente": col(["GERENTE"]),
@@ -419,6 +419,8 @@ def _read_active_contracts(path_text: str, modified_ns: int) -> dict[str, object
     out = out.loc[identity.ne("")].copy()
     out["Valor_Mensal_Base"] = out["Valor_Mensal_Base"].map(_money_value)
     out["Data_Inicio"] = pd.to_datetime(out["Data_Inicio"], errors="coerce", dayfirst=True)
+    out["Data_Fim"] = pd.to_datetime(out["Data_Fim"], errors="coerce", dayfirst=True)
+    out["Meses_2027_Base"] = pd.to_numeric(out["Meses_2027_Base"], errors="coerce")
     out["Qtd_Equipamentos"] = pd.to_numeric(out["Qtd_Equipamentos"], errors="coerce").fillna(0.0)
     out["Linha_Sugerida"] = out.apply(lambda r: _contract_budget_line(r.get("Gerente"), r.get("Linha_Produto")), axis=1)
     out["Fonte_Linha"] = np.where(out["Gerente"].fillna("").astype(str).str.strip().ne(""), "Gerente", "Linha de produto")
@@ -442,69 +444,37 @@ def active_contracts_source() -> dict[str, object]:
     return _read_active_contracts(str(path), path.stat().st_mtime_ns)
 
 
-def active_contract_overrides_file() -> str:
-    return f"carteira_ativa_{APP_YEAR}.csv"
-
-
-def load_active_contract_overrides() -> pd.DataFrame:
-    df = load_table(active_contract_overrides_file(), ACTIVE_CONTRACT_OVERRIDE_COLUMNS)
-    for col in ["Meses_2027", "Valor_Mensal_Ajustado"]:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-    return df
-
-
 def build_active_contracts_budget() -> tuple[pd.DataFrame, dict[str, object]]:
-    """Combina a planilha operacional com as decisões de planejamento para 2027."""
+    """Usa a planilha operacional revisada como fonte oficial da carteira ativa de 2027."""
     source = active_contracts_source()
     base = source.get("data", pd.DataFrame()).copy()
     if base.empty:
         return base, source
-    overrides = load_active_contract_overrides()
-    if not overrides.empty:
-        base = base.merge(overrides, on="Contrato_Key", how="left")
-    else:
-        for col in ACTIVE_CONTRACT_OVERRIDE_COLUMNS:
-            if col != "Contrato_Key":
-                base[col] = np.nan
 
-    base["Status_2027"] = base["Status_2027"].fillna("").astype(str).replace("", "REVISAR")
-    base["Linha_Budget"] = base["Linha_Budget"].fillna("").astype(str)
-    base.loc[base["Linha_Budget"].eq(""), "Linha_Budget"] = base.loc[base["Linha_Budget"].eq(""), "Linha_Sugerida"]
-    default_months = np.where(base["Valor_Mensal_Base"].gt(0), 12.0, 0.0)
-    base["Meses_2027"] = pd.to_numeric(base["Meses_2027"], errors="coerce")
-    base["Meses_2027"] = base["Meses_2027"].where(base["Meses_2027"].notna(), default_months).clip(0, 12)
-    base["Valor_Mensal_Ajustado"] = pd.to_numeric(base["Valor_Mensal_Ajustado"], errors="coerce")
-    base["Valor_Mensal_Ajustado"] = base["Valor_Mensal_Ajustado"].where(base["Valor_Mensal_Ajustado"].notna(), base["Valor_Mensal_Base"])
-    base["Observacao_2027"] = base["Observacao_2027"].fillna("").astype(str)
-    base["Receita_2027_Preliminar"] = base["Valor_Mensal_Base"] * np.where(base["Valor_Mensal_Base"].gt(0), 12, 0)
+    # A base revisada passa a ser a fonte oficial; não existe mais etapa/status de revisão no app.
+    base["Linha_Budget"] = base["Linha_Sugerida"].fillna("LOCACAO").astype(str).map(norm)
+    base["Valor_Mensal_Ajustado"] = pd.to_numeric(base["Valor_Mensal_Base"], errors="coerce").fillna(0.0)
+
+    budget_start = pd.Timestamp(year=APP_YEAR, month=1, day=1)
+    budget_end = pd.Timestamp(year=APP_YEAR, month=12, day=31)
+
+    def months_in_budget(row: pd.Series) -> int:
+        explicit = pd.to_numeric(pd.Series([row.get("Meses_2027_Base")]), errors="coerce").iloc[0]
+        if pd.notna(explicit):
+            return int(max(0, min(12, round(float(explicit)))))
+
+        start = pd.to_datetime(row.get("Data_Inicio"), errors="coerce")
+        end = pd.to_datetime(row.get("Data_Fim"), errors="coerce")
+        effective_start = max(start, budget_start) if pd.notna(start) else budget_start
+        effective_end = min(end, budget_end) if pd.notna(end) else budget_end
+        if effective_end < effective_start:
+            return 0
+        return int((effective_end.year - effective_start.year) * 12 + effective_end.month - effective_start.month + 1)
+
+    base["Meses_2027"] = base.apply(months_in_budget, axis=1).astype(int)
+    base.loc[base["Valor_Mensal_Ajustado"].le(0), "Meses_2027"] = 0
     base["Receita_2027_Planejada"] = base["Valor_Mensal_Ajustado"] * base["Meses_2027"]
-    base.loc[base["Status_2027"].map(norm).eq("NAO CONSIDERAR"), "Receita_2027_Planejada"] = 0.0
-    base["Validado"] = ~base["Status_2027"].map(norm).eq("REVISAR")
-    base["Receita_2027_Validada"] = np.where(base["Validado"], base["Receita_2027_Planejada"], 0.0)
     return base, source
-
-
-def save_active_contract_override(user: dict, row: pd.Series, status: str, months: int, monthly: float, line: str, note: str) -> None:
-    latest = load_active_contract_overrides()
-    key = str(row.get("Contrato_Key", ""))
-    payload = {
-        "Contrato_Key": key,
-        "Status_2027": status,
-        "Meses_2027": int(months),
-        "Valor_Mensal_Ajustado": float(monthly),
-        "Linha_Budget": norm(line),
-        "Observacao_2027": str(note or "").strip(),
-        "Atualizado_Por": user["nome"],
-        "Atualizado_Em": now_text(),
-    }
-    if latest.empty or not latest["Contrato_Key"].astype(str).eq(key).any():
-        latest = pd.concat([latest, pd.DataFrame([payload])], ignore_index=True)
-    else:
-        idx = latest.index[latest["Contrato_Key"].astype(str).eq(key)][0]
-        for k, v in payload.items():
-            latest.at[idx, k] = v
-    save_table(active_contract_overrides_file(), latest[ACTIVE_CONTRACT_OVERRIDE_COLUMNS], f"First Budget: revisão carteira {key}")
-
 
 def scope_active_contracts(df: pd.DataFrame, line: str) -> pd.DataFrame:
     if df is None or df.empty:
@@ -1263,28 +1233,26 @@ if page == "Visão Geral":
     if carteira_scope.empty:
         st.info("A planilha de contratos ativos ainda não foi localizada no repositório do Budget.")
     else:
-        validada = float(carteira_scope["Receita_2027_Validada"].sum())
-        preliminar = float(carteira_scope["Receita_2027_Preliminar"].sum())
-        pendentes = int((carteira_scope["Status_2027"].astype(str).map(norm) == "REVISAR").sum())
-        sem_valor = int(carteira_scope["Valor_Mensal_Base"].le(0).sum())
+        receita_contratada = float(carteira_scope["Receita_2027_Planejada"].sum())
+        mensal = float(carteira_scope["Valor_Mensal_Ajustado"].sum())
+        contratos = int(len(carteira_scope))
+        sem_valor = int(carteira_scope["Valor_Mensal_Ajustado"].le(0).sum())
         a1, a2, a3, a4 = st.columns(4)
         with a1:
-            kpi("Carteira validada", brl(validada), f"Receita base {APP_YEAR} revisada")
+            kpi("Receita contratada 2027", brl(receita_contratada), "Carteira ativa da base revisada")
         with a2:
-            kpi("Run-rate preliminar", brl(preliminar), "Valor mensal atual × 12 · antes da revisão")
+            kpi("Faturamento mensal", brl(mensal), "Somatório mensal da carteira atual")
         with a3:
-            kpi("Contratos pendentes", f"{pendentes}", "Precisam validar meses/renovação")
+            kpi("Contratos / linhas", f"{contratos}", "Registros ativos considerados no Budget")
         with a4:
-            kpi("Sem valor mensal", f"{sem_valor}", "Não entram na receita até ajuste")
-        if pendentes:
-            st.caption("A carteira só entra como receita contratada validada após a revisão dos contratos. O arquivo fonte não possui data de término/vigência contratual.")
+            kpi("Sem valor mensal", f"{sem_valor}", "Não geram receita enquanto permanecerem zerados")
 
 
 # =========================================================
 # PÁGINA: CARTEIRA ATIVA
 # =========================================================
 elif page == "Carteira Ativa":
-    hero("Carteira Ativa 2027", "Contratos existentes formam a base da receita; o forecast comercial deve registrar somente expansão, renovação e novos negócios.")
+    hero("Carteira Ativa 2027", "A base revisada de contratos existentes é a fonte oficial da receita contratada; o forecast comercial registra somente expansão, renovação e novos negócios.")
 
     source_name = str(active_contracts_meta.get("source", "") or "")
     warning = str(active_contracts_meta.get("warning", "") or "")
@@ -1297,81 +1265,43 @@ elif page == "Carteira Ativa":
     if carteira_scope.empty:
         st.info("Inclua a planilha de contratos ativos no mesmo repositório do app para carregar a carteira automaticamente.")
     else:
-        monthly_runrate = float(carteira_scope["Valor_Mensal_Base"].sum())
-        preliminar = float(carteira_scope["Receita_2027_Preliminar"].sum())
-        validada = float(carteira_scope["Receita_2027_Validada"].sum())
-        pendentes = int((carteira_scope["Status_2027"].astype(str).map(norm) == "REVISAR").sum())
-        sem_valor = int(carteira_scope["Valor_Mensal_Base"].le(0).sum())
+        monthly_runrate = float(carteira_scope["Valor_Mensal_Ajustado"].sum())
+        receita_2027 = float(carteira_scope["Receita_2027_Planejada"].sum())
+        contratos = int(len(carteira_scope))
+        clientes_carteira = int(carteira_scope["Cliente"].replace("", np.nan).nunique())
+        sem_valor = int(carteira_scope["Valor_Mensal_Ajustado"].le(0).sum())
 
-        c1, c2, c3, c4, c5 = st.columns(5)
+        c1, c2, c3, c4 = st.columns(4)
         with c1:
-            kpi("Contratos / linhas", f"{len(carteira_scope)}", "Registros da carteira vigente")
+            kpi("Receita contratada 2027", brl(receita_2027), "Base atualizada considerada no orçamento")
         with c2:
-            kpi("Faturamento mensal", brl(monthly_runrate), "Somatório dos valores mensais informados")
+            kpi("Faturamento mensal", brl(monthly_runrate), "Somatório dos valores mensais vigentes")
         with c3:
-            kpi("Run-rate 2027", brl(preliminar), "Hipótese inicial: 12 meses")
+            kpi("Contratos / linhas", f"{contratos}", f"{clientes_carteira} clientes na carteira")
         with c4:
-            kpi("Base validada", brl(validada), "Somente contratos revisados")
-        with c5:
-            kpi("Pendentes", f"{pendentes}", f"{sem_valor} sem valor mensal")
+            kpi("Sem valor mensal", f"{sem_valor}", "Registros zerados não compõem a receita")
 
         st.markdown(
-            "<div class='storage-note'><b>Importante:</b> esta planilha informa início e valor de faturamento, mas não traz uma data de término/vigência do contrato. Por isso, o sistema usa 12 meses apenas como <b>run-rate preliminar</b>. A receita oficial do Budget deve usar a coluna <b>Base validada</b>, após informar quantos meses o contrato permanecerá em 2027.</div>",
+            "<div class='storage-note'><b>Base oficial:</b> a planilha atualizada é considerada revisada e entra diretamente na receita contratada de 2027. Quando houver término ou quantidade de meses de 2027 informados na própria base, o app respeita essa informação; na ausência deles, projeta o contrato até dezembro de 2027.</div>",
             unsafe_allow_html=True,
         )
-
-        section("Revisão da carteira para 2027")
-        if is_controladoria:
-            selector = carteira_scope.copy()
-            selector["_label"] = selector.apply(
-                lambda r: f"{str(r.get('Numero_Contrato','')).strip() or 'Sem nº'} · {str(r.get('Cliente','')).strip()} · {str(r.get('Linha_Produto','')).strip() or str(r.get('Gerente','')).strip()} · {brl(r.get('Valor_Mensal_Base',0))}/mês",
-                axis=1,
-            )
-            labels = selector["_label"].tolist()
-            selected_label = st.selectbox("Contrato / linha para revisar", labels)
-            selected_row = selector.loc[selector["_label"].eq(selected_label)].iloc[0]
-            current_status = str(selected_row.get("Status_2027", "REVISAR"))
-            status_index = ACTIVE_CONTRACT_STATUS.index(current_status) if current_status in ACTIVE_CONTRACT_STATUS else 0
-            current_line = norm(selected_row.get("Linha_Budget", selected_row.get("Linha_Sugerida", "LOCACAO")))
-            line_index = LINES.index(current_line) if current_line in LINES else LINES.index("LOCACAO")
-            with st.form("active_contract_review_form"):
-                r1, r2, r3, r4 = st.columns([1.25, .85, 1, 1])
-                with r1:
-                    status_2027 = st.selectbox("Tratamento 2027", ACTIVE_CONTRACT_STATUS, index=status_index)
-                with r2:
-                    meses_2027 = st.number_input("Meses em 2027", min_value=0, max_value=12, value=int(float(selected_row.get("Meses_2027", 12) or 0)), step=1)
-                with r3:
-                    valor_mensal_ajustado = st.number_input(
-                        "Valor mensal 2027", min_value=0.0,
-                        value=float(selected_row.get("Valor_Mensal_Ajustado", 0) or 0), step=100.0, format="%.2f",
-                    )
-                with r4:
-                    linha_budget = st.selectbox("Linha Budget", LINES, index=line_index, format_func=line_label)
-                obs_2027 = st.text_area("Observação / renovação / encerramento previsto", value=str(selected_row.get("Observacao_2027", "") or ""), height=80)
-                save_review = st.form_submit_button("Salvar revisão da carteira", width="stretch")
-            if save_review:
-                try:
-                    save_active_contract_override(user, selected_row, status_2027, int(meses_2027), float(valor_mensal_ajustado), linha_budget, obs_2027)
-                    st.success("Contrato revisado para o Budget 2027.")
-                    st.rerun()
-                except Exception as exc:
-                    st.error(f"Não foi possível salvar a revisão: {exc}")
-        else:
-            st.caption("A revisão da carteira é feita pela Controladoria. Seu perfil visualiza os contratos da respectiva linha.")
 
         section("Contratos existentes")
         view = carteira_scope.copy()
         view["Contrato"] = view["Numero_Contrato"].fillna("").astype(str)
         view["Cliente"] = view["Cliente"].fillna("").astype(str)
         view["Início"] = view["Data_Inicio"].map(date_br)
+        view["Fim"] = view["Data_Fim"].map(date_br) if "Data_Fim" in view.columns else ""
         view["Linha"] = view["Linha_Budget"].map(line_label)
         view["Valor mensal"] = view["Valor_Mensal_Ajustado"]
         view["Receita 2027"] = view["Receita_2027_Planejada"]
-        view["Status"] = view["Status_2027"]
-        view["Meses"] = view["Meses_2027"].astype(int)
+        view["Meses 2027"] = view["Meses_2027"].astype(int)
         view["Produto / linha"] = view["Linha_Produto"].fillna("").astype(str)
         view["Qtd. eq."] = view["Qtd_Equipamentos"]
-        display_cols = ["Contrato", "Cliente", "Linha", "Produto / linha", "Início", "Valor mensal", "Meses", "Receita 2027", "Status", "Qtd. eq."]
+        display_cols = ["Contrato", "Cliente", "Linha", "Produto / linha", "Início"]
+        if "Data_Fim" in carteira_scope.columns and carteira_scope["Data_Fim"].notna().any():
+            display_cols.append("Fim")
+        display_cols += ["Valor mensal", "Meses 2027", "Receita 2027", "Qtd. eq."]
         st.dataframe(
             view[display_cols], hide_index=True, width="stretch",
             column_config={
