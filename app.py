@@ -83,6 +83,14 @@ HISTORY_COLUMNS = [
     "Data_Hora", "Antes_JSON", "Depois_JSON",
 ]
 
+ACTIVE_CONTRACT_OVERRIDE_COLUMNS = [
+    "Contrato_Key", "Status_2027", "Meses_2027", "Valor_Mensal_Ajustado",
+    "Linha_Budget", "Observacao_2027", "Atualizado_Por", "Atualizado_Em",
+]
+ACTIVE_CONTRACT_STATUS = [
+    "REVISAR", "VALIDADO 12 MESES", "VIGENTE PARCIAL", "EM RENOVAÇÃO", "NÃO CONSIDERAR",
+]
+
 
 # =========================================================
 # VISUAL
@@ -118,16 +126,10 @@ st.markdown(
     .hero p {{ margin:0; opacity:.82; font-size:.87rem; }}
     .hero .eyebrow {{ font-size:.70rem; font-weight:900; letter-spacing:.24em; color:#B9D9F0; text-transform:uppercase; }}
 
-    .kpi {{
-        position:relative; overflow:hidden; background:linear-gradient(145deg,#FFFFFF 0%,#FBFDFF 100%);
-        border:1px solid #C9DDED; border-radius:19px; padding:17px 17px 15px; min-height:132px;
-        box-shadow:0 10px 26px rgba(7,27,51,.075); display:flex; flex-direction:column; justify-content:space-between;
-    }}
-    .kpi::before {{ content:""; position:absolute; left:0; top:0; bottom:0; width:5px; background:{BLUE}; }}
-    .kpi::after {{ content:""; position:absolute; width:82px; height:82px; border-radius:50%; right:-30px; top:-34px; background:rgba(79,154,209,.10); }}
-    .kpi .label {{ color:#52677D; font-size:.74rem; font-weight:950; letter-spacing:.055em; text-transform:uppercase; line-height:1.28; padding-left:2px; }}
-    .kpi .value {{ color:{NAVY}; font-size:clamp(1.22rem,1.62vw,1.72rem); font-weight:950; line-height:1.08; margin-top:12px; white-space:normal; overflow-wrap:anywhere; letter-spacing:-.025em; }}
-    .kpi .note {{ color:#667085; font-size:.76rem; margin-top:10px; line-height:1.42; }}
+    .kpi {{ background:#FFFFFF; border:1px solid {BORDER}; border-radius:17px; padding:13px 14px; min-height:105px; box-shadow:0 8px 22px rgba(7,27,51,.045); }}
+    .kpi .label {{ color:{GRAY}; font-size:.68rem; font-weight:900; letter-spacing:.05em; text-transform:uppercase; }}
+    .kpi .value {{ color:{NAVY}; font-size:1.35rem; font-weight:950; margin-top:10px; white-space:nowrap; }}
+    .kpi .note {{ color:{GRAY}; font-size:.72rem; margin-top:8px; line-height:1.35; }}
 
     .section {{ color:{NAVY}; font-size:1.08rem; font-weight:900; margin:15px 0 7px; padding-bottom:7px; border-bottom:1px solid {BORDER}; }}
     .pill {{ display:inline-flex; align-items:center; border-radius:999px; padding:5px 9px; background:#EAF3FA; color:{BLUE}; font-size:.68rem; font-weight:900; }}
@@ -310,6 +312,24 @@ def resolve_catalog_choice(selected: str, manual: str, new_option: str) -> str:
     return str(manual or "").strip() if selected == new_option else str(selected or "").strip()
 
 
+def filter_catalog_options(options: list[str], query: str, limit: int = 120) -> list[str]:
+    """Busca rápida por qualquer parte do nome/código, ignorando acentos e ordem dos termos."""
+    values = [str(x).strip() for x in options if str(x).strip()]
+    q = norm(query)
+    if not q:
+        return values[:limit]
+    tokens = [token for token in q.split() if token]
+    ranked = []
+    for value in values:
+        key = norm(value)
+        if all(token in key for token in tokens):
+            # Prioriza itens que começam com a busca e depois os mais curtos.
+            starts = 0 if key.startswith(q) else 1
+            ranked.append((starts, len(key), key, value))
+    ranked.sort(key=lambda row: (row[0], row[1], row[2]))
+    return [row[3] for row in ranked[:limit]]
+
+
 def _active_contracts_path() -> Path | None:
     """Localiza a planilha operacional de contratos ativos no repositório do Budget."""
     here = Path(__file__).resolve().parent
@@ -395,9 +415,9 @@ def _read_active_contracts(path_text: str, modified_ns: int) -> dict[str, object
         "Loja": col(["LOJA"]),
         "CNPJ_CPF": col(["CNPJ/CPF", "CNPJ CPF"]),
         "Cliente": col(["RAZÃO SOCIAL", "RAZAO SOCIAL", "CLIENTE"]),
-        "Data_Inicio": col(["INICIO", "INÍCIO"]),
-        "Data_Fim": col(["FIM", "TÉRMINO", "TERMINO", "VENCIMENTO", "DATA FIM", "DATA TÉRMINO", "DATA TERMINO"]),
-        "Meses_2027_Base": col(["MESES 2027", "MESES_2027", "QTD MESES 2027", "QTD. MESES 2027"]),
+        "Data_Inicio": col(["INICIO", "INÍCIO", "DATA INICIO", "DATA INÍCIO"]),
+        "Data_Fim": col(["FIM", "TÉRMINO", "TERMINO", "DATA FIM", "VIGÊNCIA FINAL", "VIGENCIA FINAL"]),
+        "Meses_2027_Base": col(["MESES 2027", "MESES EM 2027", "QTD MESES 2027"]),
         "Valor_Mensal_Base": col(["VALOR FATURAMENTO", "VALOR FATURAMENTO ", "VALOR"]),
         "Vendedor": col(["VENDEDOR"]),
         "Gerente": col(["GERENTE"]),
@@ -444,37 +464,76 @@ def active_contracts_source() -> dict[str, object]:
     return _read_active_contracts(str(path), path.stat().st_mtime_ns)
 
 
+def active_contract_overrides_file() -> str:
+    return f"carteira_ativa_{APP_YEAR}.csv"
+
+
+def load_active_contract_overrides() -> pd.DataFrame:
+    df = load_table(active_contract_overrides_file(), ACTIVE_CONTRACT_OVERRIDE_COLUMNS)
+    for col in ["Meses_2027", "Valor_Mensal_Ajustado"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    return df
+
+
 def build_active_contracts_budget() -> tuple[pd.DataFrame, dict[str, object]]:
-    """Usa a planilha operacional revisada como fonte oficial da carteira ativa de 2027."""
+    """Usa a planilha revisada de contratos como fonte oficial da receita contratada de 2027."""
     source = active_contracts_source()
     base = source.get("data", pd.DataFrame()).copy()
     if base.empty:
         return base, source
 
-    # A base revisada passa a ser a fonte oficial; não existe mais etapa/status de revisão no app.
-    base["Linha_Budget"] = base["Linha_Sugerida"].fillna("LOCACAO").astype(str).map(norm)
+    base["Linha_Budget"] = base["Linha_Sugerida"].fillna("LOCACAO").astype(str)
     base["Valor_Mensal_Ajustado"] = pd.to_numeric(base["Valor_Mensal_Base"], errors="coerce").fillna(0.0)
 
-    budget_start = pd.Timestamp(year=APP_YEAR, month=1, day=1)
-    budget_end = pd.Timestamp(year=APP_YEAR, month=12, day=31)
+    year_start = pd.Timestamp(APP_YEAR, 1, 1)
+    year_end = pd.Timestamp(APP_YEAR, 12, 31)
 
-    def months_in_budget(row: pd.Series) -> int:
+    def months_in_budget(row) -> int:
         explicit = pd.to_numeric(pd.Series([row.get("Meses_2027_Base")]), errors="coerce").iloc[0]
         if pd.notna(explicit):
             return int(max(0, min(12, round(float(explicit)))))
-
-        start = pd.to_datetime(row.get("Data_Inicio"), errors="coerce")
-        end = pd.to_datetime(row.get("Data_Fim"), errors="coerce")
-        effective_start = max(start, budget_start) if pd.notna(start) else budget_start
-        effective_end = min(end, budget_end) if pd.notna(end) else budget_end
-        if effective_end < effective_start:
+        if float(row.get("Valor_Mensal_Base", 0) or 0) <= 0:
             return 0
-        return int((effective_end.year - effective_start.year) * 12 + effective_end.month - effective_start.month + 1)
+        start_date = row.get("Data_Inicio")
+        end_date = row.get("Data_Fim")
+        start_date = pd.Timestamp(start_date) if pd.notna(start_date) else year_start
+        end_date = pd.Timestamp(end_date) if pd.notna(end_date) else year_end
+        active_start = max(start_date, year_start)
+        active_end = min(end_date, year_end)
+        if active_end < active_start:
+            return 0
+        return int((active_end.year - active_start.year) * 12 + active_end.month - active_start.month + 1)
 
-    base["Meses_2027"] = base.apply(months_in_budget, axis=1).astype(int)
-    base.loc[base["Valor_Mensal_Ajustado"].le(0), "Meses_2027"] = 0
+    base["Meses_2027"] = base.apply(months_in_budget, axis=1)
     base["Receita_2027_Planejada"] = base["Valor_Mensal_Ajustado"] * base["Meses_2027"]
+    base["Receita_2027_Validada"] = base["Receita_2027_Planejada"]
+    base["Receita_2027_Preliminar"] = base["Receita_2027_Planejada"]
+    base["Validado"] = True
+    base["Status_2027"] = "BASE ATUALIZADA"
     return base, source
+
+
+def save_active_contract_override(user: dict, row: pd.Series, status: str, months: int, monthly: float, line: str, note: str) -> None:
+    latest = load_active_contract_overrides()
+    key = str(row.get("Contrato_Key", ""))
+    payload = {
+        "Contrato_Key": key,
+        "Status_2027": status,
+        "Meses_2027": int(months),
+        "Valor_Mensal_Ajustado": float(monthly),
+        "Linha_Budget": norm(line),
+        "Observacao_2027": str(note or "").strip(),
+        "Atualizado_Por": user["nome"],
+        "Atualizado_Em": now_text(),
+    }
+    if latest.empty or not latest["Contrato_Key"].astype(str).eq(key).any():
+        latest = pd.concat([latest, pd.DataFrame([payload])], ignore_index=True)
+    else:
+        idx = latest.index[latest["Contrato_Key"].astype(str).eq(key)][0]
+        for k, v in payload.items():
+            latest.at[idx, k] = v
+    save_table(active_contract_overrides_file(), latest[ACTIVE_CONTRACT_OVERRIDE_COLUMNS], f"First Budget: revisão carteira {key}")
+
 
 def scope_active_contracts(df: pd.DataFrame, line: str) -> pd.DataFrame:
     if df is None or df.empty:
@@ -1234,25 +1293,24 @@ if page == "Visão Geral":
         st.info("A planilha de contratos ativos ainda não foi localizada no repositório do Budget.")
     else:
         receita_contratada = float(carteira_scope["Receita_2027_Planejada"].sum())
-        mensal = float(carteira_scope["Valor_Mensal_Ajustado"].sum())
-        contratos = int(len(carteira_scope))
-        sem_valor = int(carteira_scope["Valor_Mensal_Ajustado"].le(0).sum())
+        mensal = float(carteira_scope["Valor_Mensal_Base"].sum())
+        sem_valor = int(carteira_scope["Valor_Mensal_Base"].le(0).sum())
         a1, a2, a3, a4 = st.columns(4)
         with a1:
-            kpi("Receita contratada 2027", brl(receita_contratada), "Carteira ativa da base revisada")
+            kpi("Receita contratada 2027", brl(receita_contratada), "Base atualizada de contratos ativos")
         with a2:
-            kpi("Faturamento mensal", brl(mensal), "Somatório mensal da carteira atual")
+            kpi("Faturamento mensal", brl(mensal), "Somatório dos valores mensais da carteira")
         with a3:
-            kpi("Contratos / linhas", f"{contratos}", "Registros ativos considerados no Budget")
+            kpi("Contratos / linhas", f"{len(carteira_scope)}", "Registros ativos na base")
         with a4:
-            kpi("Sem valor mensal", f"{sem_valor}", "Não geram receita enquanto permanecerem zerados")
+            kpi("Sem valor mensal", f"{sem_valor}", "Não compõem receita enquanto estiverem zerados")
 
 
 # =========================================================
 # PÁGINA: CARTEIRA ATIVA
 # =========================================================
 elif page == "Carteira Ativa":
-    hero("Carteira Ativa 2027", "A base revisada de contratos existentes é a fonte oficial da receita contratada; o forecast comercial registra somente expansão, renovação e novos negócios.")
+    hero("Carteira Ativa 2027", "A base revisada de contratos existentes forma automaticamente a receita contratada do orçamento.")
 
     source_name = str(active_contracts_meta.get("source", "") or "")
     warning = str(active_contracts_meta.get("warning", "") or "")
@@ -1265,24 +1323,24 @@ elif page == "Carteira Ativa":
     if carteira_scope.empty:
         st.info("Inclua a planilha de contratos ativos no mesmo repositório do app para carregar a carteira automaticamente.")
     else:
-        monthly_runrate = float(carteira_scope["Valor_Mensal_Ajustado"].sum())
+        monthly_runrate = float(carteira_scope["Valor_Mensal_Base"].sum())
         receita_2027 = float(carteira_scope["Receita_2027_Planejada"].sum())
-        contratos = int(len(carteira_scope))
-        clientes_carteira = int(carteira_scope["Cliente"].replace("", np.nan).nunique())
-        sem_valor = int(carteira_scope["Valor_Mensal_Ajustado"].le(0).sum())
+        sem_valor = int(carteira_scope["Valor_Mensal_Base"].le(0).sum())
+        clientes_carteira = int(carteira_scope["Cliente"].fillna("").astype(str).str.strip().replace("", np.nan).nunique())
 
         c1, c2, c3, c4 = st.columns(4)
         with c1:
-            kpi("Receita contratada 2027", brl(receita_2027), "Base atualizada considerada no orçamento")
+            kpi("Receita contratada 2027", brl(receita_2027), "Calculada diretamente da base atualizada")
         with c2:
-            kpi("Faturamento mensal", brl(monthly_runrate), "Somatório dos valores mensais vigentes")
+            kpi("Faturamento mensal", brl(monthly_runrate), "Valor mensal atual da carteira")
         with c3:
-            kpi("Contratos / linhas", f"{contratos}", f"{clientes_carteira} clientes na carteira")
+            kpi("Contratos / linhas", f"{len(carteira_scope)}", f"{clientes_carteira} clientes na carteira")
         with c4:
-            kpi("Sem valor mensal", f"{sem_valor}", "Registros zerados não compõem a receita")
+            kpi("Sem valor mensal", f"{sem_valor}", "Registros zerados não entram na receita")
 
         st.markdown(
-            "<div class='storage-note'><b>Base oficial:</b> a planilha atualizada é considerada revisada e entra diretamente na receita contratada de 2027. Quando houver término ou quantidade de meses de 2027 informados na própria base, o app respeita essa informação; na ausência deles, projeta o contrato até dezembro de 2027.</div>",
+            "<div class='storage-note'><b>Base oficial:</b> os contratos carregados nesta tela já são considerados revisados. "
+            "Quando a planilha trouxer término ou meses de vigência em 2027, o Budget respeita essa informação; nos demais casos, considera a vigência até dezembro de 2027.</div>",
             unsafe_allow_html=True,
         )
 
@@ -1293,15 +1351,12 @@ elif page == "Carteira Ativa":
         view["Início"] = view["Data_Inicio"].map(date_br)
         view["Fim"] = view["Data_Fim"].map(date_br) if "Data_Fim" in view.columns else ""
         view["Linha"] = view["Linha_Budget"].map(line_label)
-        view["Valor mensal"] = view["Valor_Mensal_Ajustado"]
+        view["Valor mensal"] = view["Valor_Mensal_Base"]
         view["Receita 2027"] = view["Receita_2027_Planejada"]
         view["Meses 2027"] = view["Meses_2027"].astype(int)
         view["Produto / linha"] = view["Linha_Produto"].fillna("").astype(str)
         view["Qtd. eq."] = view["Qtd_Equipamentos"]
-        display_cols = ["Contrato", "Cliente", "Linha", "Produto / linha", "Início"]
-        if "Data_Fim" in carteira_scope.columns and carteira_scope["Data_Fim"].notna().any():
-            display_cols.append("Fim")
-        display_cols += ["Valor mensal", "Meses 2027", "Receita 2027", "Qtd. eq."]
+        display_cols = ["Contrato", "Cliente", "Linha", "Produto / linha", "Início", "Fim", "Valor mensal", "Meses 2027", "Receita 2027", "Qtd. eq."]
         st.dataframe(
             view[display_cols], hide_index=True, width="stretch",
             column_config={
@@ -1340,6 +1395,30 @@ elif page == "Forecast Comercial":
             help="Na locação, informe início, prazo e os equipamentos. O sistema soma as mensalidades dos itens e distribui a receita nas competências de 2027.",
         )
 
+        # Em vendas/serviços o cadastro pode ser extenso. A busca fica fora do formulário
+        # para filtrar a lista imediatamente enquanto o usuário digita.
+        sales_client_options = CLIENT_OPTIONS
+        sales_product_options = PRODUCT_OPTIONS
+        if new_revenue_type in {"Venda", "Serviço"}:
+            st.markdown("**Localizar cadastro**")
+            s1, s2 = st.columns(2)
+            with s1:
+                client_search = st.text_input(
+                    "🔎 Buscar cliente", key="sales_client_search",
+                    placeholder="Digite parte do nome do cliente",
+                    help="A busca ignora acentos e aceita mais de uma palavra.",
+                )
+                sales_client_options = filter_catalog_options(CLIENT_OPTIONS, client_search)
+                st.caption(f"{len(sales_client_options)} cliente(s) exibido(s)" + (" · refine a busca" if len(sales_client_options) >= 120 else ""))
+            with s2:
+                product_search = st.text_input(
+                    "🔎 Buscar produto", key="sales_product_search",
+                    placeholder="Digite código, descrição ou linha do produto",
+                    help="Pesquise por qualquer parte do código ou descrição.",
+                )
+                sales_product_options = filter_catalog_options(PRODUCT_OPTIONS, product_search)
+                st.caption(f"{len(sales_product_options)} produto(s) exibido(s)" + (" · refine a busca" if len(sales_product_options) >= 120 else ""))
+
         with st.form("new_forecast_form", clear_on_submit=True):
             a, b, c = st.columns(3)
             with a:
@@ -1348,11 +1427,12 @@ elif page == "Forecast Comercial":
                 else:
                     new_line = user["linha"]
                     st.text_input("Linha de negócio", value=line_label(new_line), disabled=True)
-                client_choices = CLIENT_OPTIONS + [NEW_CLIENT_OPTION]
+                base_client_choices = sales_client_options if new_revenue_type in {"Venda", "Serviço"} else CLIENT_OPTIONS
+                client_choices = base_client_choices + [NEW_CLIENT_OPTION]
                 cliente_selecionado = st.selectbox(
                     "Cliente *", client_choices,
-                    index=0 if CLIENT_OPTIONS else len(client_choices) - 1,
-                    help="Digite parte do nome para pesquisar. A lista usa a BASE BI e clientes já registrados no Budget.",
+                    index=0 if base_client_choices else len(client_choices) - 1,
+                    help="Use a busca acima para reduzir a lista. Você também pode digitar dentro desta seleção.",
                 )
                 novo_cliente = st.text_input("Novo cliente", placeholder="Preencha somente se escolher + Novo cliente")
                 tipo_cliente = CLIENT_TYPES.get(cliente_selecionado, "Novo") if cliente_selecionado != NEW_CLIENT_OPTION else "Novo"
@@ -1408,11 +1488,11 @@ elif page == "Forecast Comercial":
                         [f"{APP_YEAR}-{m:02d}" for m in range(1, 13)],
                         format_func=month_label_from_comp,
                     )
-                    product_choices = PRODUCT_OPTIONS + [NEW_PRODUCT_OPTION]
+                    product_choices = sales_product_options + [NEW_PRODUCT_OPTION]
                     produto_selecionado = st.selectbox(
                         "Produto / linha / oportunidade", product_choices,
-                        index=0 if PRODUCT_OPTIONS else len(product_choices) - 1,
-                        help="Digite parte do código ou descrição para pesquisar no cadastro existente.",
+                        index=0 if sales_product_options else len(product_choices) - 1,
+                        help="Use a busca acima para localizar rapidamente por código ou descrição.",
                     )
                     produto_novo = st.text_input("Novo produto / oportunidade", placeholder="Preencha somente se não existir no cadastro")
                     produto = resolve_catalog_choice(produto_selecionado, produto_novo, NEW_PRODUCT_OPTION)
