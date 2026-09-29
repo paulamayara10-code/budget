@@ -65,6 +65,7 @@ MONTHS = {
     7: "Jul", 8: "Ago", 9: "Set", 10: "Out", 11: "Nov", 12: "Dez",
 }
 PROBABILITY_WEIGHTS = {"Alta": 0.90, "Média": 0.60, "Baixa": 0.30}
+TABLE_CACHE_TTL = 20  # reduz chamadas ao GitHub sem esconder alterações por muito tempo
 NEW_CLIENT_OPTION = "➕ Novo cliente"
 NEW_PRODUCT_OPTION = "➕ Novo equipamento / produto / oportunidade"
 
@@ -222,58 +223,343 @@ def _master_base_path() -> Path | None:
     return candidates[0]
 
 
+
+def _to_number_series(series: pd.Series) -> pd.Series:
+    """Converte valores monetários/números em formatos PT-BR e padrão numérico."""
+    if pd.api.types.is_numeric_dtype(series):
+        return pd.to_numeric(series, errors="coerce").fillna(0.0)
+    txt = series.astype(str).str.strip().str.replace(r"R\$\s*", "", regex=True).str.replace(" ", "", regex=False)
+    both = txt.str.contains(",", na=False) & txt.str.contains(r"\.", na=False)
+    txt.loc[both] = txt.loc[both].str.replace(".", "", regex=False).str.replace(",", ".", regex=False)
+    only_comma = txt.str.contains(",", na=False) & ~txt.str.contains(r"\.", na=False)
+    txt.loc[only_comma] = txt.loc[only_comma].str.replace(",", ".", regex=False)
+    return pd.to_numeric(txt, errors="coerce").fillna(0.0)
+
+
+def _to_month_period_series(series: pd.Series) -> pd.Series:
+    """Converte datas, seriais Excel e rótulos como ago/26 ou 08/2026 em período mensal."""
+    dates = pd.Series(pd.NaT, index=series.index, dtype="datetime64[ns]")
+    numeric = pd.to_numeric(series, errors="coerce")
+    excel_mask = numeric.notna() & numeric.between(20000, 80000)
+    if excel_mask.any():
+        dates.loc[excel_mask] = pd.to_datetime(numeric.loc[excel_mask], unit="D", origin="1899-12-30", errors="coerce")
+    if (~excel_mask).any():
+        dates.loc[~excel_mask] = pd.to_datetime(series.loc[~excel_mask], errors="coerce", dayfirst=True)
+
+    missing = dates.isna()
+    if missing.any():
+        aliases = {
+            "JAN": 1, "JANEIRO": 1, "FEV": 2, "FEVEREIRO": 2, "MAR": 3, "MARCO": 3,
+            "ABR": 4, "ABRIL": 4, "MAI": 5, "MAIO": 5, "JUN": 6, "JUNHO": 6,
+            "JUL": 7, "JULHO": 7, "AGO": 8, "AGOSTO": 8, "SET": 9, "SETEMBRO": 9,
+            "OUT": 10, "OUTUBRO": 10, "NOV": 11, "NOVEMBRO": 11, "DEZ": 12, "DEZEMBRO": 12,
+        }
+        import re
+        for idx, raw in series.loc[missing].items():
+            txt = norm(raw)
+            if not txt:
+                continue
+            month = None
+            year = None
+            numeric_match = re.search(r"\b(0?[1-9]|1[0-2])[\s/\-.]+(20\d{2}|\d{2})\b", txt)
+            if numeric_match:
+                month = int(numeric_match.group(1))
+                year = int(numeric_match.group(2))
+            else:
+                for token, m in aliases.items():
+                    if re.search(rf"\b{token}\b", txt):
+                        month = m
+                        break
+                year_match = re.search(r"\b(20\d{2}|\d{2})\b", txt)
+                if year_match:
+                    year = int(year_match.group(1))
+            if month is not None:
+                if year is None:
+                    year = APP_YEAR - 1
+                if year < 100:
+                    year += 2000
+                try:
+                    dates.loc[idx] = pd.Timestamp(year=year, month=month, day=1)
+                except ValueError:
+                    pass
+    return dates.dt.to_period("M")
+
+
+@st.cache_data(show_spinner=False, ttl=300)
+def _read_sulamita_purchase_history(path_text: str, modified_ns: int) -> dict[str, object]:
+    """Calcula a base histórica mensal dos clientes atendidos por Sulamita na BASE BI.
+
+    A média usa até os 12 últimos meses disponíveis antes de 2027 e inclui meses sem compra
+    no denominador. Isso evita superestimar distribuidores que compram de forma esporádica.
+    """
+    path = Path(path_text)
+    empty = {
+        "detail": pd.DataFrame(), "monthly": pd.DataFrame(), "source": path.name,
+        "warning": "", "start": "", "end": "", "months": 0,
+        "avg_monthly": 0.0, "annual_projection": 0.0, "clients": 0,
+    }
+    try:
+        header = pd.read_excel(path, sheet_name="BANCO DE DADOS FATURAMENTO", engine="openpyxl", nrows=0)
+        client_col = _optional_col(header, ["NOME DO CLIENTE", "CLIENTE", "RAZÃO SOCIAL", "RAZAO SOCIAL"])
+        seller_col = _optional_col(header, ["VENDEDOR / REPRESENTANTE", "VENDEDOR", "REPRESENTANTE"])
+        month_col = _optional_col(header, ["MÊS", "MES", "COMPETENCIA", "COMPETÊNCIA"])
+        date_col = _optional_col(header, ["DT Emissao", "DT EMISSÃO", "DATA EMISSÃO", "DATA EMISSAO"])
+        value_col = _optional_col(header, ["VALOR BRUTO", "VALOR ", "VALOR", "FATURAMENTO"])
+        manager_col = _optional_col(header, ["GERENTE"])
+        segment_col = _optional_col(header, ["SEGMENTO"])
+        required = [client_col, seller_col, value_col]
+        if any(col is None for col in required) or (month_col is None and date_col is None):
+            missing = []
+            if client_col is None: missing.append("cliente")
+            if seller_col is None: missing.append("vendedor/representante")
+            if value_col is None: missing.append("valor")
+            if month_col is None and date_col is None: missing.append("mês/data")
+            empty["warning"] = "Não foi possível calcular a média Sulamita: faltam colunas de " + ", ".join(missing) + "."
+            return empty
+        usecols = []
+        for col in [client_col, seller_col, month_col, date_col, value_col, manager_col, segment_col]:
+            if col and col not in usecols:
+                usecols.append(col)
+        df = pd.read_excel(path, sheet_name="BANCO DE DADOS FATURAMENTO", engine="openpyxl", usecols=usecols)
+    except Exception as exc:
+        empty["warning"] = f"Não foi possível ler o histórico Sulamita: {exc}"
+        return empty
+
+    seller_n = df[seller_col].fillna("").astype(str).map(norm)
+    sulamita = df[seller_n.str.contains("SULAMITA", regex=False, na=False)].copy()
+    if sulamita.empty:
+        empty["warning"] = "Nenhum faturamento da Sulamita foi localizado na BASE BI."
+        return empty
+
+    official = _to_month_period_series(sulamita[month_col]) if month_col else pd.Series(pd.NaT, index=sulamita.index)
+    if date_col:
+        fallback = _to_month_period_series(sulamita[date_col])
+        official = official.where(official.notna(), fallback)
+    sulamita["_MES"] = official
+    sulamita["_VALOR"] = _to_number_series(sulamita[value_col])
+    sulamita["_CLIENTE"] = sulamita[client_col].fillna("").astype(str).str.strip()
+    sulamita = sulamita[
+        sulamita["_MES"].notna()
+        & sulamita["_CLIENTE"].map(norm).ne("")
+        & sulamita["_MES"].map(lambda p: p.year if isinstance(p, pd.Period) else 9999).lt(APP_YEAR)
+    ].copy()
+    if sulamita.empty:
+        empty["warning"] = f"Não há histórico Sulamita anterior a {APP_YEAR} com competência válida."
+        return empty
+
+    end = sulamita["_MES"].max()
+    start = max(sulamita["_MES"].min(), end - 11)
+    window = pd.period_range(start=start, end=end, freq="M")
+    months_count = len(window)
+    sulamita = sulamita[sulamita["_MES"].isin(window)].copy()
+
+    monthly_client = (
+        sulamita.groupby(["_CLIENTE", "_MES"], as_index=False)["_VALOR"].sum()
+        .rename(columns={"_CLIENTE": "Cliente", "_MES": "Competencia", "_VALOR": "Valor"})
+    )
+    clients = sorted(monthly_client["Cliente"].dropna().astype(str).unique(), key=norm)
+    grid = pd.MultiIndex.from_product([clients, list(window)], names=["Cliente", "Competencia"]).to_frame(index=False)
+    grid = grid.merge(monthly_client, on=["Cliente", "Competencia"], how="left")
+    grid["Valor"] = pd.to_numeric(grid["Valor"], errors="coerce").fillna(0.0)
+
+    recent_window = list(window[-3:]) if months_count >= 3 else list(window)
+    detail_rows = []
+    for client, grp in grid.groupby("Cliente", sort=False):
+        total = float(grp["Valor"].sum())
+        active_months = int(grp["Valor"].gt(0).sum())
+        avg = total / months_count if months_count else 0.0
+        recent = grp[grp["Competencia"].isin(recent_window)]
+        recent_avg = float(recent["Valor"].sum()) / len(recent_window) if recent_window else 0.0
+        frequency = active_months / months_count if months_count else 0.0
+        if total == 0 and active_months == 0:
+            continue
+        detail_rows.append({
+            "Cliente": client,
+            "Total_Historico": total,
+            "Meses_Com_Compra": active_months,
+            "Meses_Base": months_count,
+            "Frequencia_Compra": frequency,
+            "Media_Mensal": avg,
+            "Media_3M": recent_avg,
+            "Projecao_2027": avg * 12,
+        })
+    detail = pd.DataFrame(detail_rows)
+    if not detail.empty:
+        detail = detail.sort_values("Projecao_2027", ascending=False).reset_index(drop=True)
+
+    monthly = grid.groupby("Competencia", as_index=False)["Valor"].sum().rename(columns={"Valor": "Faturamento_Sulamita"})
+    avg_monthly = float(monthly["Faturamento_Sulamita"].sum()) / months_count if months_count else 0.0
+    return {
+        "detail": detail,
+        "monthly": monthly,
+        "source": path.name,
+        "warning": "",
+        "start": str(start),
+        "end": str(end),
+        "months": months_count,
+        "avg_monthly": avg_monthly,
+        "annual_projection": avg_monthly * 12,
+        "clients": int(len(detail)),
+    }
+
+
 @st.cache_data(show_spinner=False, ttl=300)
 def _read_master_catalog(path_text: str, modified_ns: int) -> dict[str, object]:
-    """Lê somente clientes e produtos da BASE BI para agilizar os lançamentos."""
+    """Lê clientes e catálogo de produtos da BASE BI com metadados para busca em várias camadas."""
     path = Path(path_text)
     try:
         book = pd.ExcelFile(path, engine="openpyxl")
         if "BANCO DE DADOS FATURAMENTO" not in book.sheet_names:
-            return {"clients": [], "products": [], "source": path.name, "warning": "A aba BANCO DE DADOS FATURAMENTO não foi localizada."}
-        df = pd.read_excel(path, sheet_name="BANCO DE DADOS FATURAMENTO", engine="openpyxl")
+            return {
+                "clients": [], "products": [], "client_records": [], "product_records": [],
+                "source": path.name, "warning": "A aba BANCO DE DADOS FATURAMENTO não foi localizada."
+            }
+        header = pd.read_excel(path, sheet_name="BANCO DE DADOS FATURAMENTO", engine="openpyxl", nrows=0)
+        candidate_groups = [
+            ["NOME DO CLIENTE", "CLIENTE", "RAZÃO SOCIAL", "RAZAO SOCIAL"],
+            ["COD CLIENTE", "CÓD CLIENTE", "CODIGO CLIENTE", "CÓDIGO CLIENTE", "COD. CLIENTE", "CLIENTE CODIGO", "CLIENTE"],
+            ["VENDEDOR / REPRESENTANTE", "VENDEDOR", "REPRESENTANTE"], ["GERENTE"],
+            ["CIDADE", "MUNICIPIO", "MUNICÍPIO"], ["UF", "ESTADO"], ["SEGMENTO"],
+            ["PRODUTO", "ITEM", "CÓDIGO PRODUTO", "CODIGO PRODUTO", "COD PRODUTO", "CÓD PRODUTO"],
+            ["DESCRIÇÃO", "DESCRICAO", "DESC PRODUTO", "DESCRIÇÃO PRODUTO"],
+            ["LINHA DE PRODUTO", "LINHA PRODUTO", "LINHA"],
+            ["GRUPO", "GRUPO PRODUTO", "GRUPO DE PRODUTO", "CATEGORIA", "FAMILIA", "FAMÍLIA"],
+            ["FORNECEDOR", "FABRICANTE", "MARCA"], ["NCM", "COD NCM", "CÓDIGO NCM", "CODIGO NCM"],
+        ]
+        needed_cols = []
+        for group in candidate_groups:
+            found = _optional_col(header, group)
+            if found and found not in needed_cols:
+                needed_cols.append(found)
+        df = pd.read_excel(
+            path,
+            sheet_name="BANCO DE DADOS FATURAMENTO",
+            engine="openpyxl",
+            usecols=needed_cols or None,
+        )
     except Exception as exc:
-        return {"clients": [], "products": [], "source": path.name, "warning": f"Não foi possível ler a BASE BI: {exc}"}
+        return {
+            "clients": [], "products": [], "client_records": [], "product_records": [],
+            "source": path.name, "warning": f"Não foi possível ler a BASE BI: {exc}"
+        }
 
-    client_col = _optional_col(df, ["NOME DO CLIENTE", "CLIENTE", "RAZÃO SOCIAL", "RAZAO SOCIAL"])
-    product_col = _optional_col(df, ["PRODUTO", "ITEM", "CÓDIGO PRODUTO", "CODIGO PRODUTO"])
-    desc_col = _optional_col(df, ["DESCRIÇÃO", "DESCRICAO", "LINHA DE PRODUTO"])
+    # Clientes: nome + código + vendedor/gerente + UF/cidade/segmento quando disponíveis.
+    client_name_col = _optional_col(df, ["NOME DO CLIENTE", "CLIENTE", "RAZÃO SOCIAL", "RAZAO SOCIAL"])
+    client_code_col = _optional_col(df, ["COD CLIENTE", "CÓD CLIENTE", "CODIGO CLIENTE", "CÓDIGO CLIENTE", "COD. CLIENTE", "CLIENTE CODIGO", "CLIENTE"])
+    seller_col = _optional_col(df, ["VENDEDOR / REPRESENTANTE", "VENDEDOR", "REPRESENTANTE"])
+    manager_col = _optional_col(df, ["GERENTE"])
+    city_col = _optional_col(df, ["CIDADE", "MUNICIPIO", "MUNICÍPIO"])
+    uf_col = _optional_col(df, ["UF", "ESTADO"])
+    segment_col = _optional_col(df, ["SEGMENTO"])
 
-    clients = []
-    if client_col:
-        clients = sorted({
-            str(value).strip() for value in df[client_col].dropna().tolist()
-            if str(value).strip() and norm(value) not in {"NAO INFORMADO", "NAN", "NONE"}
-        }, key=lambda x: norm(x))
+    client_records_by_key: dict[str, dict[str, object]] = {}
+    if client_name_col:
+        for _, row in df.iterrows():
+            name = str(row.get(client_name_col, "") or "").strip()
+            if not name or norm(name) in {"NAO INFORMADO", "NAN", "NONE"}:
+                continue
+            key = norm(name)
+            rec = client_records_by_key.setdefault(key, {
+                "value": name, "code": set(), "seller": set(), "manager": set(),
+                "city": set(), "uf": set(), "segment": set(),
+            })
+            for field, col in [
+                ("code", client_code_col), ("seller", seller_col), ("manager", manager_col),
+                ("city", city_col), ("uf", uf_col), ("segment", segment_col),
+            ]:
+                if col:
+                    value = str(row.get(col, "") or "").strip()
+                    if value and norm(value) not in {"NAO INFORMADO", "NAN", "NONE"}:
+                        rec[field].add(value)
 
-    products = []
-    if product_col or desc_col:
-        codes = df[product_col].fillna("").astype(str).str.strip() if product_col else pd.Series("", index=df.index)
-        descs = df[desc_col].fillna("").astype(str).str.strip() if desc_col else pd.Series("", index=df.index)
-        labels = []
-        for code, desc in zip(codes, descs):
-            if norm(code) in {"NAN", "NONE", "NAO INFORMADO"}:
-                code = ""
-            if norm(desc) in {"NAN", "NONE", "NAO INFORMADO"}:
-                desc = ""
-            label = f"{code} | {desc}" if code and desc and norm(code) != norm(desc) else (code or desc)
-            if label:
-                labels.append(label)
-        products = sorted(set(labels), key=lambda x: norm(x))
+    client_records = []
+    for rec in client_records_by_key.values():
+        clean = {k: (" / ".join(sorted(v, key=norm)) if isinstance(v, set) else v) for k, v in rec.items()}
+        clean["search_blob"] = " | ".join(str(clean.get(k, "")) for k in ["value", "code", "seller", "manager", "city", "uf", "segment"])
+        clean["_search_blob_n"] = norm(clean["search_blob"])
+        clean["_value_n"] = norm(clean.get("value", ""))
+        clean["_code_n"] = norm(clean.get("code", ""))
+        clean["_description_n"] = ""
+        client_records.append(clean)
+    client_records.sort(key=lambda r: norm(r["value"]))
+    clients = [r["value"] for r in client_records]
 
-    return {"clients": clients, "products": products, "source": path.name, "warning": ""}
+    # Produtos: código + descrição + linha + grupo/categoria + segmento + fornecedor + NCM.
+    product_col = _optional_col(df, ["PRODUTO", "ITEM", "CÓDIGO PRODUTO", "CODIGO PRODUTO", "COD PRODUTO", "CÓD PRODUTO"])
+    desc_col = _optional_col(df, ["DESCRIÇÃO", "DESCRICAO", "DESC PRODUTO", "DESCRIÇÃO PRODUTO"])
+    line_col = _optional_col(df, ["LINHA DE PRODUTO", "LINHA PRODUTO", "LINHA"])
+    group_col = _optional_col(df, ["GRUPO", "GRUPO PRODUTO", "GRUPO DE PRODUTO", "CATEGORIA", "FAMILIA", "FAMÍLIA"])
+    supplier_col = _optional_col(df, ["FORNECEDOR", "FABRICANTE", "MARCA"])
+    ncm_col = _optional_col(df, ["NCM", "COD NCM", "CÓDIGO NCM", "CODIGO NCM"])
+
+    product_records_by_key: dict[str, dict[str, object]] = {}
+    for _, row in df.iterrows():
+        code = str(row.get(product_col, "") or "").strip() if product_col else ""
+        desc = str(row.get(desc_col, "") or "").strip() if desc_col else ""
+        if norm(code) in {"NAN", "NONE", "NAO INFORMADO"}:
+            code = ""
+        if norm(desc) in {"NAN", "NONE", "NAO INFORMADO"}:
+            desc = ""
+        canonical = f"{code} | {desc}" if code and desc and norm(code) != norm(desc) else (code or desc)
+        if not canonical:
+            continue
+        key = norm(canonical)
+        rec = product_records_by_key.setdefault(key, {
+            "value": canonical, "code": code, "description": desc,
+            "line": set(), "group": set(), "segment": set(), "supplier": set(), "ncm": set(),
+        })
+        for field, col in [
+            ("line", line_col), ("group", group_col), ("segment", segment_col),
+            ("supplier", supplier_col), ("ncm", ncm_col),
+        ]:
+            if col:
+                value = str(row.get(col, "") or "").strip()
+                if value and norm(value) not in {"NAO INFORMADO", "NAN", "NONE"}:
+                    rec[field].add(value)
+
+    product_records = []
+    for rec in product_records_by_key.values():
+        clean = {k: (" / ".join(sorted(v, key=norm)) if isinstance(v, set) else v) for k, v in rec.items()}
+        extras = []
+        if clean.get("line"):
+            extras.append(f"Linha: {clean['line']}")
+        if clean.get("group"):
+            extras.append(f"Grupo: {clean['group']}")
+        clean["display"] = clean["value"] + (" · " + " · ".join(extras) if extras else "")
+        clean["search_blob"] = " | ".join(str(clean.get(k, "")) for k in [
+            "value", "code", "description", "line", "group", "segment", "supplier", "ncm"
+        ])
+        clean["_search_blob_n"] = norm(clean["search_blob"])
+        clean["_value_n"] = norm(clean.get("value", ""))
+        clean["_code_n"] = norm(clean.get("code", ""))
+        clean["_description_n"] = norm(clean.get("description", ""))
+        product_records.append(clean)
+    product_records.sort(key=lambda r: norm(r["value"]))
+    products = [r["value"] for r in product_records]
+
+    return {
+        "clients": clients, "products": products,
+        "client_records": client_records, "product_records": product_records,
+        "source": path.name, "warning": "",
+    }
 
 
 def build_input_catalog(forecast_df: pd.DataFrame) -> dict[str, object]:
     """Combina cadastro mestre da BASE BI com nomes já utilizados no First Budget."""
     path = _master_base_path()
-    master = {"clients": [], "products": [], "source": "", "warning": "BASE BI não localizada no repositório do Budget."}
+    master = {
+        "clients": [], "products": [], "client_records": [], "product_records": [],
+        "source": "", "warning": "BASE BI não localizada no repositório do Budget."
+    }
     if path is not None:
         master = _read_master_catalog(str(path), path.stat().st_mtime_ns)
 
     master_clients = list(master.get("clients", []))
     master_products = list(master.get("products", []))
-    forecast_clients = []
-    forecast_products = []
+    client_records = [dict(x) for x in master.get("client_records", [])]
+    product_records = [dict(x) for x in master.get("product_records", [])]
+    forecast_clients: list[str] = []
+    forecast_products: list[str] = []
     if forecast_df is not None and not forecast_df.empty:
         if "Cliente" in forecast_df.columns:
             forecast_clients = [str(x).strip() for x in forecast_df["Cliente"].dropna().tolist() if str(x).strip()]
@@ -289,7 +575,7 @@ def build_input_catalog(forecast_df: pd.DataFrame) -> dict[str, object]:
                     pass
 
     def unique_labels(values: list[str]) -> list[str]:
-        out = {}
+        out: dict[str, str] = {}
         for value in values:
             label = str(value).strip()
             key = norm(label)
@@ -299,10 +585,24 @@ def build_input_catalog(forecast_df: pd.DataFrame) -> dict[str, object]:
 
     clients = unique_labels(master_clients + forecast_clients)
     products = unique_labels(master_products + forecast_products)
+
+    known_client = {norm(r.get("value", "")) for r in client_records}
+    for value in clients:
+        if norm(value) not in known_client:
+            client_records.append({"value": value, "search_blob": value, "_search_blob_n": norm(value), "_value_n": norm(value), "_code_n": "", "_description_n": ""})
+
+    known_product = {norm(r.get("value", "")) for r in product_records}
+    for value in products:
+        if norm(value) not in known_product:
+            product_records.append({"value": value, "display": value, "search_blob": value, "_search_blob_n": norm(value), "_value_n": norm(value), "_code_n": "", "_description_n": ""})
+
+    client_records.sort(key=lambda r: norm(r.get("value", "")))
+    product_records.sort(key=lambda r: norm(r.get("value", "")))
     master_keys = {norm(x) for x in master_clients}
     client_types = {name: ("Atual" if norm(name) in master_keys else "Novo") for name in clients}
     return {
         "clients": clients, "products": products, "client_types": client_types,
+        "client_records": client_records, "product_records": product_records,
         "master_client_count": len(master_clients), "master_product_count": len(master_products),
         "source": str(master.get("source", "")), "warning": str(master.get("warning", "")),
     }
@@ -312,22 +612,135 @@ def resolve_catalog_choice(selected: str, manual: str, new_option: str) -> str:
     return str(manual or "").strip() if selected == new_option else str(selected or "").strip()
 
 
-def filter_catalog_options(options: list[str], query: str, limit: int = 120) -> list[str]:
-    """Busca rápida por qualquer parte do nome/código, ignorando acentos e ordem dos termos."""
-    values = [str(x).strip() for x in options if str(x).strip()]
+def _search_records(records: list[dict[str, object]], query: str, output_field: str = "value", limit: int = 120) -> list[str]:
+    """Pesquisa por múltiplas camadas e exige que todos os termos digitados estejam presentes."""
     q = norm(query)
-    if not q:
-        return values[:limit]
     tokens = [token for token in q.split() if token]
-    ranked = []
-    for value in values:
-        key = norm(value)
-        if all(token in key for token in tokens):
-            # Prioriza itens que começam com a busca e depois os mais curtos.
-            starts = 0 if key.startswith(q) else 1
-            ranked.append((starts, len(key), key, value))
+    if not q:
+        values = []
+        seen = set()
+        for rec in records:
+            output = str(rec.get(output_field, rec.get("value", "")) or "").strip()
+            key = norm(output)
+            if output and key and key not in seen:
+                seen.add(key)
+                values.append(output)
+        return sorted(values, key=norm)[:limit]
+    ranked: list[tuple[int, int, str, str]] = []
+    for rec in records:
+        output = str(rec.get(output_field, rec.get("value", "")) or "").strip()
+        if not output:
+            continue
+        blob = str(rec.get("_search_blob_n") or norm(rec.get("search_blob", output)))
+        if tokens and not all(token in blob for token in tokens):
+            continue
+        value_norm = str(rec.get("_value_n") or norm(rec.get("value", output)))
+        code_norm = str(rec.get("_code_n") or norm(rec.get("code", "")))
+        desc_norm = str(rec.get("_description_n") or norm(rec.get("description", "")))
+        # Código exato/prefixo primeiro, depois descrição/nome, depois demais camadas.
+        if q and (code_norm == q or value_norm == q):
+            tier = 0
+        elif q and (code_norm.startswith(q) or value_norm.startswith(q)):
+            tier = 1
+        elif q and (q in desc_norm or q in value_norm):
+            tier = 2
+        else:
+            tier = 3
+        ranked.append((tier, len(blob), value_norm, output))
     ranked.sort(key=lambda row: (row[0], row[1], row[2]))
     return [row[3] for row in ranked[:limit]]
+
+
+def filter_catalog_options(options: list[str], query: str, limit: int = 120) -> list[str]:
+    """Fallback para cadastros sem metadados: busca em qualquer parte do rótulo."""
+    records = [{"value": str(x), "search_blob": str(x)} for x in options if str(x).strip()]
+    return _search_records(records, query, "value", limit)
+
+
+def filter_dataframe_search(df: pd.DataFrame, query: str) -> pd.DataFrame:
+    """Busca livre em todas as colunas de uma tabela, inclusive JSON, contrato, cliente e produto."""
+    if df is None or df.empty or not str(query or "").strip():
+        return df.copy() if isinstance(df, pd.DataFrame) else df
+    tokens = [token for token in norm(query).split() if token]
+    if not tokens:
+        return df.copy()
+    text_cols = []
+    for col in df.columns:
+        try:
+            text_cols.append(df[col].fillna("").astype(str))
+        except Exception:
+            pass
+    if not text_cols:
+        return df.copy()
+    blob = text_cols[0]
+    for series in text_cols[1:]:
+        blob = blob.str.cat(series, sep=" | ")
+    blob_n = blob.map(norm)
+    mask = pd.Series(True, index=df.index)
+    for token in tokens:
+        mask &= blob_n.str.contains(token, regex=False, na=False)
+    return df.loc[mask].copy()
+
+
+def filter_budget_search(df: pd.DataFrame, query: str) -> pd.DataFrame:
+    """Busca geral: texto da linha + metadados do cadastro mestre de clientes/produtos."""
+    if df is None or df.empty or not str(query or "").strip():
+        return df.copy() if isinstance(df, pd.DataFrame) else df
+
+    # Correspondência direta em qualquer coluna da base exibida.
+    direct = filter_dataframe_search(df, query)
+    matched_idx = set(direct.index.tolist())
+
+    # Correspondência indireta: ex. usuário busca pelo grupo/linha, mas o forecast guarda só código/descrição.
+    product_records = globals().get("PRODUCT_RECORDS", [])
+    client_records = globals().get("CLIENT_RECORDS", [])
+    matched_products = set(norm(x) for x in _search_records(product_records, query, "value", limit=5000))
+    matched_clients = set(norm(x) for x in _search_records(client_records, query, "value", limit=5000))
+
+    for idx, row in df.iterrows():
+        if idx in matched_idx:
+            continue
+        client = norm(row.get("Cliente", ""))
+        if client and client in matched_clients:
+            matched_idx.add(idx)
+            continue
+
+        product_keys = {
+            norm(row.get("Produto_Linha", "")),
+            norm(row.get("Linha_Produto", "")),
+        }
+        raw_items = str(row.get("Itens_Contrato_JSON", "") or "").strip()
+        if raw_items:
+            try:
+                payload = json.loads(raw_items)
+                if isinstance(payload, list):
+                    product_keys.update(norm(item.get("Equipamento", "")) for item in payload if isinstance(item, dict))
+            except Exception:
+                pass
+        product_keys.discard("")
+        if product_keys.intersection(matched_products):
+            matched_idx.add(idx)
+
+    return df.loc[df.index.isin(matched_idx)].copy()
+
+
+def _editor_selected_equipment_values(key: str) -> list[str]:
+    """Preserva opções já escolhidas quando a busca do catálogo é refinada no data_editor."""
+    state = st.session_state.get(key, {})
+    found: list[str] = []
+    if not isinstance(state, dict):
+        return found
+    edited = state.get("edited_rows", {})
+    if isinstance(edited, dict):
+        for payload in edited.values():
+            if isinstance(payload, dict) and payload.get("Equipamento"):
+                found.append(str(payload["Equipamento"]))
+    added = state.get("added_rows", [])
+    if isinstance(added, list):
+        for payload in added:
+            if isinstance(payload, dict) and payload.get("Equipamento"):
+                found.append(str(payload["Equipamento"]))
+    return found
 
 
 def _active_contracts_path() -> Path | None:
@@ -475,6 +888,28 @@ def load_active_contract_overrides() -> pd.DataFrame:
     return df
 
 
+def _contract_periods_2027(row: dict | pd.Series) -> list[pd.Period]:
+    """Retorna as competências efetivamente contratadas em 2027, respeitando início, fim e meses revisados."""
+    year_start = pd.Period(f"{APP_YEAR}-01", freq="M")
+    year_end = pd.Period(f"{APP_YEAR}-12", freq="M")
+    if float(pd.to_numeric(pd.Series([row.get("Valor_Mensal_Base", 0)]), errors="coerce").fillna(0).iloc[0]) <= 0:
+        return []
+
+    start_raw = pd.to_datetime(row.get("Data_Inicio"), errors="coerce", dayfirst=True)
+    end_raw = pd.to_datetime(row.get("Data_Fim"), errors="coerce", dayfirst=True)
+    start_period = max(start_raw.to_period("M"), year_start) if pd.notna(start_raw) else year_start
+    end_period = min(end_raw.to_period("M"), year_end) if pd.notna(end_raw) else year_end
+    if end_period < start_period:
+        return []
+
+    periods = list(pd.period_range(start_period, end_period, freq="M"))
+    explicit = pd.to_numeric(pd.Series([row.get("Meses_2027_Base")]), errors="coerce").iloc[0]
+    if pd.notna(explicit):
+        qty = int(max(0, min(12, round(float(explicit)))))
+        periods = periods[:qty]
+    return periods
+
+
 def build_active_contracts_budget() -> tuple[pd.DataFrame, dict[str, object]]:
     """Usa a planilha revisada de contratos como fonte oficial da receita contratada de 2027."""
     source = active_contracts_source()
@@ -485,32 +920,65 @@ def build_active_contracts_budget() -> tuple[pd.DataFrame, dict[str, object]]:
     base["Linha_Budget"] = base["Linha_Sugerida"].fillna("LOCACAO").astype(str)
     base["Valor_Mensal_Ajustado"] = pd.to_numeric(base["Valor_Mensal_Base"], errors="coerce").fillna(0.0)
 
-    year_start = pd.Timestamp(APP_YEAR, 1, 1)
-    year_end = pd.Timestamp(APP_YEAR, 12, 31)
-
-    def months_in_budget(row) -> int:
-        explicit = pd.to_numeric(pd.Series([row.get("Meses_2027_Base")]), errors="coerce").iloc[0]
-        if pd.notna(explicit):
-            return int(max(0, min(12, round(float(explicit)))))
-        if float(row.get("Valor_Mensal_Base", 0) or 0) <= 0:
-            return 0
-        start_date = row.get("Data_Inicio")
-        end_date = row.get("Data_Fim")
-        start_date = pd.Timestamp(start_date) if pd.notna(start_date) else year_start
-        end_date = pd.Timestamp(end_date) if pd.notna(end_date) else year_end
-        active_start = max(start_date, year_start)
-        active_end = min(end_date, year_end)
-        if active_end < active_start:
-            return 0
-        return int((active_end.year - active_start.year) * 12 + active_end.month - active_start.month + 1)
-
-    base["Meses_2027"] = base.apply(months_in_budget, axis=1)
+    base["Meses_2027"] = base.apply(lambda row: len(_contract_periods_2027(row)), axis=1)
     base["Receita_2027_Planejada"] = base["Valor_Mensal_Ajustado"] * base["Meses_2027"]
     base["Receita_2027_Validada"] = base["Receita_2027_Planejada"]
     base["Receita_2027_Preliminar"] = base["Receita_2027_Planejada"]
     base["Validado"] = True
     base["Status_2027"] = "BASE ATUALIZADA"
     return base, source
+
+
+@st.cache_data(show_spinner=False, ttl=120)
+def expand_active_contracts_monthly(df: pd.DataFrame) -> pd.DataFrame:
+    """Transforma a carteira contratada em receita mensal, sem alterar a planilha fonte."""
+    columns = ["Contrato_Key", "Numero_Contrato", "Linha", "Competencia", "Cliente", "Linha_Produto", "Receita_Contratada"]
+    if df is None or df.empty:
+        return pd.DataFrame(columns=columns)
+    rows: list[dict] = []
+    for _, contract in df.iterrows():
+        monthly = float(pd.to_numeric(pd.Series([contract.get("Valor_Mensal_Ajustado", contract.get("Valor_Mensal_Base", 0))]), errors="coerce").fillna(0).iloc[0])
+        if monthly <= 0:
+            continue
+        for period in _contract_periods_2027(contract):
+            rows.append({
+                "Contrato_Key": str(contract.get("Contrato_Key", "")),
+                "Numero_Contrato": str(contract.get("Numero_Contrato", "") or ""),
+                "Linha": norm(contract.get("Linha_Budget", contract.get("Linha_Sugerida", "LOCACAO"))) or "LOCACAO",
+                "Competencia": str(period),
+                "Cliente": str(contract.get("Cliente", "") or ""),
+                "Linha_Produto": str(contract.get("Linha_Produto", "") or ""),
+                "Receita_Contratada": monthly,
+            })
+    return pd.DataFrame(rows, columns=columns)
+
+
+@st.cache_data(show_spinner=False, ttl=120)
+def build_revenue_summary_monthly(contract_monthly: pd.DataFrame, forecast_monthly: pd.DataFrame) -> pd.DataFrame:
+    """Consolida Carteira Ativa + Forecast Comercial sem misturar as duas origens."""
+    parts: list[pd.DataFrame] = []
+    if contract_monthly is not None and not contract_monthly.empty:
+        c = contract_monthly.groupby(["Linha", "Competencia"], as_index=False)["Receita_Contratada"].sum()
+        c["Forecast_Bruto"] = 0.0
+        c["Forecast_Ponderado"] = 0.0
+        parts.append(c)
+    if forecast_monthly is not None and not forecast_monthly.empty:
+        f = forecast_monthly.groupby(["Linha", "Competencia"], as_index=False).agg(
+            Forecast_Bruto=("Receita_Prevista", "sum"),
+            Forecast_Ponderado=("Receita_Ponderada", "sum"),
+        )
+        f["Receita_Contratada"] = 0.0
+        parts.append(f)
+    if not parts:
+        return pd.DataFrame(columns=["Linha", "Competencia", "Receita_Contratada", "Forecast_Bruto", "Forecast_Ponderado", "Receita_Projetada_Bruta", "Receita_Projetada_Ponderada"])
+    out = pd.concat(parts, ignore_index=True).groupby(["Linha", "Competencia"], as_index=False).agg(
+        Receita_Contratada=("Receita_Contratada", "sum"),
+        Forecast_Bruto=("Forecast_Bruto", "sum"),
+        Forecast_Ponderado=("Forecast_Ponderado", "sum"),
+    )
+    out["Receita_Projetada_Bruta"] = out["Receita_Contratada"] + out["Forecast_Bruto"]
+    out["Receita_Projetada_Ponderada"] = out["Receita_Contratada"] + out["Forecast_Ponderado"]
+    return out
 
 
 def save_active_contract_override(user: dict, row: pd.Series, status: str, months: int, monthly: float, line: str, note: str) -> None:
@@ -622,6 +1090,9 @@ def contract_items_metrics(editor_value: object) -> dict[str, object]:
 
     is_new_equipment = frame["Equipamento"].eq(NEW_PRODUCT_OPTION)
     frame.loc[is_new_equipment, "Equipamento"] = frame.loc[is_new_equipment, "Equipamento_Novo"]
+    # O seletor de locação pode exibir Linha/Grupo para melhorar a busca, mas gravamos o nome canônico.
+    display_map = globals().get("PRODUCT_DISPLAY_TO_VALUE", {})
+    frame["Equipamento"] = frame["Equipamento"].map(lambda value: display_map.get(str(value), str(value)))
 
     # Remove apenas linhas totalmente vazias; linhas parcialmente preenchidas devem gerar validação.
     blank = (frame["Equipamento"].eq("") & frame["Quantidade"].eq(0) & frame["Valor_Mensal_Unitario"].eq(0) & frame["Observacao_Item"].eq(""))
@@ -678,6 +1149,7 @@ def forecast_period_label(row: pd.Series) -> str:
     return month_label_from_comp(str(row.get("Competencia", "")))
 
 
+@st.cache_data(show_spinner=False, ttl=120)
 def expand_monthly_forecast(df: pd.DataFrame) -> pd.DataFrame:
     """Expande contratos de locação por competência sem duplicar os registros gravados."""
     if df is None or df.empty:
@@ -938,7 +1410,7 @@ def github_write_bytes(name: str, data: bytes, message: str) -> None:
     raise RuntimeError("Conflito ao gravar no GitHub. Atualize a tela e tente novamente.")
 
 
-def load_table(name: str, columns: list[str]) -> pd.DataFrame:
+def _load_table_uncached(name: str, columns: list[str]) -> pd.DataFrame:
     cfg = storage_config()
     raw: bytes | None = None
     try:
@@ -947,8 +1419,8 @@ def load_table(name: str, columns: list[str]) -> pd.DataFrame:
         else:
             path = LOCAL_DATA_DIR / name
             raw = path.read_bytes() if path.exists() else None
-    except Exception as exc:
-        st.warning(f"Falha ao ler a base de planejamento: {exc}")
+    except Exception:
+        return pd.DataFrame(columns=columns)
 
     if not raw:
         return pd.DataFrame(columns=columns)
@@ -962,6 +1434,22 @@ def load_table(name: str, columns: list[str]) -> pd.DataFrame:
     return df[columns].copy()
 
 
+def _storage_signature() -> str:
+    cfg = storage_config()
+    return "|".join(str(cfg.get(k, "")) for k in ["mode", "repo", "branch", "folder"])
+
+
+@st.cache_data(show_spinner=False, ttl=TABLE_CACHE_TTL)
+def _load_table_cached(name: str, columns: tuple[str, ...], storage_signature: str) -> pd.DataFrame:
+    return _load_table_uncached(name, list(columns))
+
+
+def load_table(name: str, columns: list[str], fresh: bool = False) -> pd.DataFrame:
+    if fresh:
+        return _load_table_uncached(name, columns)
+    return _load_table_cached(name, tuple(columns), _storage_signature()).copy()
+
+
 def save_table(name: str, df: pd.DataFrame, message: str) -> None:
     data = df.to_csv(index=False).encode("utf-8-sig")
     cfg = storage_config()
@@ -972,6 +1460,7 @@ def save_table(name: str, df: pd.DataFrame, message: str) -> None:
         tmp = path.with_suffix(path.suffix + ".tmp")
         tmp.write_bytes(data)
         tmp.replace(path)
+    _load_table_cached.clear()
 
 
 def forecast_file() -> str:
@@ -982,8 +1471,8 @@ def history_file() -> str:
     return f"historico_forecast_{APP_YEAR}.csv"
 
 
-def load_forecast() -> pd.DataFrame:
-    df = load_table(forecast_file(), FORECAST_COLUMNS)
+def load_forecast(fresh: bool = False) -> pd.DataFrame:
+    df = load_table(forecast_file(), FORECAST_COLUMNS, fresh=fresh)
     numeric = [
         "Ano", "Quantidade", "Valor_Unitario", "Prazo_Contrato_Meses",
         "Valor_Mensal_Contrato", "Receita_Contrato_Total", "Meses_No_Ano",
@@ -994,12 +1483,12 @@ def load_forecast() -> pd.DataFrame:
     return df
 
 
-def load_history() -> pd.DataFrame:
-    return load_table(history_file(), HISTORY_COLUMNS)
+def load_history(fresh: bool = False) -> pd.DataFrame:
+    return load_table(history_file(), HISTORY_COLUMNS, fresh=fresh)
 
 
 def append_history(action: str, user: dict, forecast_id: str, line: str, before: dict | None, after: dict | None) -> None:
-    hist = load_history()
+    hist = load_history(fresh=True)
     row = {
         "Historico_ID": uuid.uuid4().hex[:12].upper(),
         "Forecast_ID": forecast_id,
@@ -1017,7 +1506,7 @@ def append_history(action: str, user: dict, forecast_id: str, line: str, before:
 
 def commit_forecast(action: str, user: dict, forecast_id: str, line: str, before: dict | None, after: dict | None) -> None:
     """Grava sobre a versão mais recente e bloqueia sobrescrita silenciosa de edição concorrente."""
-    latest = load_forecast()
+    latest = load_forecast(fresh=True)
 
     if action == "INCLUSÃO":
         if not latest.empty and latest["ID"].astype(str).eq(forecast_id).any():
@@ -1076,6 +1565,7 @@ def rental_items_export(forecast: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+@st.cache_data(show_spinner=False, ttl=120)
 def export_excel(forecast: pd.DataFrame, history: pd.DataFrame) -> bytes:
     out = io.BytesIO()
     itens_locacao_export = rental_items_export(forecast)
@@ -1146,6 +1636,50 @@ def export_excel(forecast: pd.DataFrame, history: pd.DataFrame) -> bytes:
     return out.getvalue()
 
 
+@st.cache_data(show_spinner=False, ttl=120)
+def export_revenue_excel(revenue_monthly: pd.DataFrame, contracts: pd.DataFrame, forecast: pd.DataFrame) -> bytes:
+    out = io.BytesIO()
+    detail = revenue_monthly.copy()
+    if not detail.empty:
+        detail["Mês"] = detail["Competencia"].map(month_label_from_comp)
+        detail["Linha"] = detail["Linha"].map(line_label)
+        detail = detail[["Linha", "Mês", "Receita_Contratada", "Forecast_Bruto", "Forecast_Ponderado", "Receita_Projetada_Bruta", "Receita_Projetada_Ponderada"]]
+    annual = pd.DataFrame()
+    if not revenue_monthly.empty:
+        annual = revenue_monthly.groupby("Linha", as_index=False).agg(
+            Receita_Contratada=("Receita_Contratada", "sum"),
+            Forecast_Bruto=("Forecast_Bruto", "sum"),
+            Forecast_Ponderado=("Forecast_Ponderado", "sum"),
+            Receita_Projetada_Bruta=("Receita_Projetada_Bruta", "sum"),
+            Receita_Projetada_Ponderada=("Receita_Projetada_Ponderada", "sum"),
+        )
+        annual["Cobertura_Contratada"] = np.where(annual["Receita_Projetada_Ponderada"] > 0, annual["Receita_Contratada"] / annual["Receita_Projetada_Ponderada"], 0.0)
+        annual["Linha"] = annual["Linha"].map(line_label)
+    contracts_export = contracts.copy()
+    forecast_export = forecast.copy()
+    with pd.ExcelWriter(out, engine="xlsxwriter") as writer:
+        annual.to_excel(writer, index=False, sheet_name="Resumo Receita")
+        detail.to_excel(writer, index=False, sheet_name="Receita Mensal")
+        contracts_export.to_excel(writer, index=False, sheet_name="Carteira Ativa")
+        forecast_export.to_excel(writer, index=False, sheet_name="Forecast Comercial")
+        wb = writer.book
+        header = wb.add_format({"bold": True, "font_color": "white", "bg_color": NAVY})
+        money = wb.add_format({"num_format": 'R$ #,##0.00;[Red]-R$ #,##0.00'})
+        percent = wb.add_format({"num_format": "0.0%"})
+        for ws_name, frame in [("Resumo Receita", annual), ("Receita Mensal", detail), ("Carteira Ativa", contracts_export), ("Forecast Comercial", forecast_export)]:
+            ws = writer.sheets[ws_name]
+            for idx, col in enumerate(frame.columns):
+                ws.write(0, idx, col, header)
+                width = min(max(len(str(col)) + 3, 13), 40)
+                if "COBERTURA" in norm(col):
+                    ws.set_column(idx, idx, max(width, 16), percent)
+                elif any(x in norm(col) for x in ["VALOR", "RECEITA", "FORECAST"]):
+                    ws.set_column(idx, idx, max(width, 18), money)
+                else:
+                    ws.set_column(idx, idx, width)
+    return out.getvalue()
+
+
 # =========================================================
 # ACESSO E ESCOPO
 # =========================================================
@@ -1200,13 +1734,22 @@ with st.sidebar:
         scope_choice = user["linha"]
         st.caption(f"Escopo: {line_label(scope_choice)}")
 
-    pages = ["Visão Geral", "Carteira Ativa", "Forecast Comercial", "Consolidação", "Histórico"]
+    pages = ["Visão Geral", "Receita 2027", "Carteira Ativa", "Forecast Comercial", "Consolidação", "Histórico"]
     page = st.radio("Navegação", pages, label_visibility="collapsed")
 
     cfg = storage_config()
     st.divider()
+    if st.button("↻ Atualizar dados", width="stretch", help="Força uma nova leitura das bases e do GitHub."):
+        _load_table_cached.clear()
+        _read_master_catalog.clear()
+        _read_sulamita_purchase_history.clear()
+        _read_active_contracts.clear()
+        expand_monthly_forecast.clear()
+        expand_active_contracts_monthly.clear()
+        build_revenue_summary_monthly.clear()
+        st.rerun()
     if cfg["mode"] == "github":
-        st.caption("Persistência: GitHub ✓")
+        st.caption(f"Persistência: GitHub ✓ · cache {TABLE_CACHE_TTL}s")
     else:
         st.caption("Persistência: Local · desenvolvimento")
 
@@ -1215,12 +1758,18 @@ with st.sidebar:
 # DADOS
 # =========================================================
 forecast = load_forecast()
-history = load_history()
+history = load_history() if page in {"Histórico", "Consolidação"} else pd.DataFrame(columns=HISTORY_COLUMNS)
 active = forecast[forecast["Status"].astype(str).str.upper().eq("ATIVO")].copy() if not forecast.empty else forecast.copy()
-input_catalog = build_input_catalog(forecast)
+input_catalog = build_input_catalog(forecast) if page != "Histórico" else {
+    "clients": [], "products": [], "client_types": {}, "client_records": [], "product_records": [],
+    "master_client_count": 0, "master_product_count": 0, "source": "", "warning": "",
+}
 CLIENT_OPTIONS = list(input_catalog.get("clients", []))
 PRODUCT_OPTIONS = list(input_catalog.get("products", []))
 CLIENT_TYPES = dict(input_catalog.get("client_types", {}))
+CLIENT_RECORDS = [dict(x) for x in input_catalog.get("client_records", [])]
+PRODUCT_RECORDS = [dict(x) for x in input_catalog.get("product_records", [])]
+
 active_contracts, active_contracts_meta = build_active_contracts_budget()
 if not active_contracts.empty:
     contract_clients = [str(x).strip() for x in active_contracts["Cliente"].dropna().tolist() if str(x).strip()]
@@ -1231,16 +1780,141 @@ if not active_contracts.empty:
     for name in CLIENT_OPTIONS:
         if norm(name) in master_client_keys:
             CLIENT_TYPES[name] = "Atual"
-active_scope = scope_df(active, scope_choice)
-active_monthly = expand_monthly_forecast(active)
-active_monthly_scope = scope_df(active_monthly, scope_choice)
 
+    known_client_records = {norm(r.get("value", "")) for r in CLIENT_RECORDS}
+    for value in contract_clients:
+        if norm(value) not in known_client_records:
+            CLIENT_RECORDS.append({"value": value, "search_blob": value, "_search_blob_n": norm(value), "_value_n": norm(value), "_code_n": "", "_description_n": ""})
+            known_client_records.add(norm(value))
+
+    known_product_records = {norm(r.get("value", "")) for r in PRODUCT_RECORDS}
+    for value in contract_products:
+        if norm(value) not in known_product_records:
+            PRODUCT_RECORDS.append({"value": value, "display": value, "search_blob": value, "_search_blob_n": norm(value), "_value_n": norm(value), "_code_n": "", "_description_n": ""})
+            known_product_records.add(norm(value))
+
+CLIENT_RECORDS.sort(key=lambda r: norm(r.get("value", "")))
+PRODUCT_RECORDS.sort(key=lambda r: norm(r.get("value", "")))
+
+# Referência histórica específica da Microtech / Sulamita. Só é carregada nas telas em que agrega valor.
+sulamita_history = {
+    "detail": pd.DataFrame(), "monthly": pd.DataFrame(), "source": "", "warning": "",
+    "start": "", "end": "", "months": 0, "avg_monthly": 0.0, "annual_projection": 0.0, "clients": 0,
+}
+if page in {"Receita 2027", "Forecast Comercial"} and scope_choice in {"CONSOLIDADO", "MICROTECH"}:
+    master_path_for_history = _master_base_path()
+    if master_path_for_history is not None:
+        sulamita_history = _read_sulamita_purchase_history(str(master_path_for_history), master_path_for_history.stat().st_mtime_ns)
+    else:
+        sulamita_history["warning"] = "BASE BI não localizada no repositório do Budget."
+
+CLIENT_VALUE_TO_DISPLAY: dict[str, str] = {}
+PRODUCT_VALUE_TO_DISPLAY: dict[str, str] = {}
+PRODUCT_DISPLAY_TO_VALUE: dict[str, str] = {}
+PRODUCT_DISPLAY_OPTIONS: list[str] = []
+if page == "Forecast Comercial":
+    for r in CLIENT_RECORDS:
+        value = str(r.get("value", "") or "").strip()
+        if not value:
+            continue
+        extras = []
+        if str(r.get("code", "") or "").strip() and norm(r.get("code", "")) != norm(value):
+            extras.append(f"Cód: {r.get('code')}")
+        location = " / ".join(x for x in [str(r.get("city", "") or "").strip(), str(r.get("uf", "") or "").strip()] if x)
+        if location:
+            extras.append(location)
+        CLIENT_VALUE_TO_DISPLAY[value] = value + (" · " + " · ".join(extras) if extras else "")
+    PRODUCT_VALUE_TO_DISPLAY = {str(r.get("value", "")): str(r.get("display", r.get("value", ""))) for r in PRODUCT_RECORDS if str(r.get("value", "")).strip()}
+    PRODUCT_DISPLAY_TO_VALUE = {display: value for value, display in PRODUCT_VALUE_TO_DISPLAY.items()}
+    PRODUCT_DISPLAY_OPTIONS = [PRODUCT_VALUE_TO_DISPLAY.get(value, value) for value in PRODUCT_OPTIONS]
+
+active_scope = scope_df(active, scope_choice)
+needs_forecast_monthly = page in {"Visão Geral", "Receita 2027", "Consolidação"}
+active_monthly = expand_monthly_forecast(active) if needs_forecast_monthly else pd.DataFrame(columns=FORECAST_COLUMNS)
+active_monthly_scope = scope_df(active_monthly, scope_choice) if needs_forecast_monthly else pd.DataFrame(columns=FORECAST_COLUMNS)
+
+
+
+def render_sulamita_history_reference(expanded: bool = False) -> None:
+    """Exibe a referência histórica dos clientes Sulamita sem somá-la ao forecast atual."""
+    detail = sulamita_history.get("detail", pd.DataFrame())
+    warning = str(sulamita_history.get("warning", "") or "")
+    with st.expander("Microtech · referência histórica dos clientes Sulamita", expanded=expanded):
+        st.caption(
+            "Base automática para planejamento: média mensal dos últimos meses disponíveis, incluindo meses sem compra. "
+            "Esta referência não é somada ao forecast comercial, evitando duplicidade antes da definição do Budget de Receita."
+        )
+        if warning:
+            st.warning(warning)
+            return
+        if detail is None or detail.empty:
+            st.info("Ainda não há histórico suficiente para calcular a referência Sulamita.")
+            return
+
+        months = int(sulamita_history.get("months", 0) or 0)
+        period_text = f"{month_label_from_comp(str(sulamita_history.get('start', '')))} a {month_label_from_comp(str(sulamita_history.get('end', '')))}"
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            kpi("Média mensal Sulamita", brl(float(sulamita_history.get("avg_monthly", 0.0))), f"{months} mês(es) na base")
+        with c2:
+            kpi("Referência anual 2027", brl(float(sulamita_history.get("annual_projection", 0.0))), "Média mensal × 12")
+        with c3:
+            kpi("Clientes com histórico", f"{int(sulamita_history.get('clients', 0) or 0)}", "Clientes atendidos pela Sulamita")
+        with c4:
+            kpi("Período analisado", period_text, "Últimos meses disponíveis")
+
+        q = st.text_input(
+            "🔎 Buscar cliente na referência Sulamita",
+            key=f"sulamita_reference_search_{'expanded' if expanded else 'collapsed'}",
+            placeholder="Nome ou parte do cliente...",
+        )
+        show = detail.copy()
+        if q:
+            tokens = [t for t in norm(q).split() if t]
+            mask = show["Cliente"].fillna("").astype(str).map(norm).map(lambda x: all(t in x for t in tokens))
+            show = show.loc[mask].copy()
+        show = show.rename(columns={
+            "Total_Historico": "Histórico no período",
+            "Meses_Com_Compra": "Meses com compra",
+            "Meses_Base": "Meses base",
+            "Frequencia_Compra": "Frequência",
+            "Media_Mensal": "Média mensal",
+            "Media_3M": "Média últimos 3 meses",
+            "Projecao_2027": "Referência 2027",
+        })
+        st.dataframe(
+            show,
+            hide_index=True,
+            width="stretch",
+            column_config={
+                "Histórico no período": st.column_config.NumberColumn(format="R$ %.2f"),
+                "Frequência": st.column_config.NumberColumn(format="%.1f%%"),
+                "Média mensal": st.column_config.NumberColumn(format="R$ %.2f"),
+                "Média últimos 3 meses": st.column_config.NumberColumn(format="R$ %.2f"),
+                "Referência 2027": st.column_config.NumberColumn(format="R$ %.2f"),
+            },
+        )
+        st.caption(
+            "Critério: para cada cliente, o total do período é dividido por todos os meses da janela, inclusive meses sem compra. "
+            "A coluna de 3 meses é apenas um sinal de tendência; a referência 2027 usa a média mensal integral."
+        )
 
 # =========================================================
 # PÁGINA: VISÃO GERAL
 # =========================================================
 if page == "Visão Geral":
     hero("First Budget 2027", "Forecast comercial como ponto de partida do orçamento anual.")
+
+    overview_search = st.text_input(
+        "🔎 Busca inteligente",
+        key="overview_smart_search",
+        placeholder="Cliente, contrato, código, descrição, linha, grupo, segmento, vendedor...",
+        help="A busca cruza os lançamentos com os metadados do cadastro mestre. Você pode combinar vários termos.",
+    )
+    if overview_search:
+        active_scope = filter_budget_search(active_scope, overview_search)
+        allowed_ids = set(active_scope["ID"].astype(str)) if not active_scope.empty else set()
+        active_monthly_scope = active_monthly_scope[active_monthly_scope["ID"].astype(str).isin(allowed_ids)].copy()
 
     bruto = float(active_monthly_scope["Receita_Prevista"].sum()) if not active_monthly_scope.empty else 0.0
     ponderado = float(active_monthly_scope["Receita_Ponderada"].sum()) if not active_monthly_scope.empty else 0.0
@@ -1289,6 +1963,8 @@ if page == "Visão Geral":
 
     section("Carteira ativa · base contratada")
     carteira_scope = scope_active_contracts(active_contracts, scope_choice)
+    if overview_search:
+        carteira_scope = filter_budget_search(carteira_scope, overview_search)
     if carteira_scope.empty:
         st.info("A planilha de contratos ativos ainda não foi localizada no repositório do Budget.")
     else:
@@ -1307,6 +1983,120 @@ if page == "Visão Geral":
 
 
 # =========================================================
+# PÁGINA: RECEITA 2027
+# =========================================================
+elif page == "Receita 2027":
+    hero("Receita 2027", "Carteira ativa + novas receitas previstas, mantendo claramente separado o que já está contratado do que ainda depende do comercial.")
+
+    contracts_scope = scope_active_contracts(active_contracts, scope_choice)
+    forecast_scope = scope_df(active, scope_choice)
+    revenue_search = st.text_input(
+        "🔎 Buscar na receita",
+        key="revenue_smart_search",
+        placeholder="Cliente, contrato, código, descrição, produto, linha, grupo, gerente...",
+        help="A busca é aplicada simultaneamente à carteira contratada e ao forecast comercial.",
+    )
+    if revenue_search:
+        contracts_scope = filter_budget_search(contracts_scope, revenue_search)
+        forecast_scope = filter_budget_search(forecast_scope, revenue_search)
+
+    contract_monthly_scope = expand_active_contracts_monthly(contracts_scope)
+    forecast_monthly_scope = expand_monthly_forecast(forecast_scope)
+    revenue_monthly = build_revenue_summary_monthly(contract_monthly_scope, forecast_monthly_scope)
+
+    receita_contratada = float(revenue_monthly["Receita_Contratada"].sum()) if not revenue_monthly.empty else 0.0
+    forecast_bruto = float(revenue_monthly["Forecast_Bruto"].sum()) if not revenue_monthly.empty else 0.0
+    forecast_pond = float(revenue_monthly["Forecast_Ponderado"].sum()) if not revenue_monthly.empty else 0.0
+    proj_pond = float(revenue_monthly["Receita_Projetada_Ponderada"].sum()) if not revenue_monthly.empty else 0.0
+    cobertura = receita_contratada / proj_pond if proj_pond else 0.0
+
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        kpi("Receita contratada", brl(receita_contratada), f"Carteira ativa considerada em {APP_YEAR}")
+    with c2:
+        kpi("Forecast novo · bruto", brl(forecast_bruto), "Novas vendas, serviços e contratos")
+    with c3:
+        kpi("Forecast novo · ponderado", brl(forecast_pond), "Aplicação da probabilidade comercial")
+    with c4:
+        kpi("Projeção 2027", brl(proj_pond), f"Contratada + forecast ponderado · {pct(cobertura)} já contratado")
+
+    if scope_choice in {"CONSOLIDADO", "MICROTECH"}:
+        render_sulamita_history_reference(expanded=(scope_choice == "MICROTECH"))
+
+    if revenue_monthly.empty:
+        st.info("Não há receita contratada nem forecast comercial para este escopo/busca.")
+    else:
+        section("Composição mensal da receita")
+        monthly = revenue_monthly.groupby("Competencia", as_index=False).agg(
+            Contratada=("Receita_Contratada", "sum"),
+            Forecast_Ponderado=("Forecast_Ponderado", "sum"),
+            Projecao=("Receita_Projetada_Ponderada", "sum"),
+        )
+        all_comp = pd.DataFrame({"Competencia": [f"{APP_YEAR}-{m:02d}" for m in range(1, 13)]})
+        monthly = all_comp.merge(monthly, on="Competencia", how="left").fillna(0)
+        monthly["Mês"] = monthly["Competencia"].map(month_label_from_comp)
+        fig = go.Figure()
+        fig.add_trace(go.Bar(x=monthly["Mês"], y=monthly["Contratada"], name="Carteira contratada", marker_color=NAVY))
+        fig.add_trace(go.Bar(x=monthly["Mês"], y=monthly["Forecast_Ponderado"], name="Forecast novo ponderado", marker_color=CYAN))
+        fig.update_layout(title="Receita projetada por mês · 2027", barmode="stack")
+        st.plotly_chart(plot_layout(fig, 370), width="stretch", config={"displayModeBar": False})
+
+        section("Resumo anual por linha")
+        annual = revenue_monthly.groupby("Linha", as_index=False).agg(
+            Receita_Contratada=("Receita_Contratada", "sum"),
+            Forecast_Bruto=("Forecast_Bruto", "sum"),
+            Forecast_Ponderado=("Forecast_Ponderado", "sum"),
+            Receita_Projetada_Bruta=("Receita_Projetada_Bruta", "sum"),
+            Receita_Projetada_Ponderada=("Receita_Projetada_Ponderada", "sum"),
+        )
+        annual["Cobertura_Contratada"] = np.where(
+            annual["Receita_Projetada_Ponderada"] > 0,
+            annual["Receita_Contratada"] / annual["Receita_Projetada_Ponderada"],
+            0.0,
+        )
+        annual["Linha"] = annual["Linha"].map(line_label)
+        st.dataframe(
+            annual,
+            hide_index=True,
+            width="stretch",
+            column_config={
+                "Receita_Contratada": st.column_config.NumberColumn("Receita contratada", format="R$ %.2f"),
+                "Forecast_Bruto": st.column_config.NumberColumn("Forecast bruto", format="R$ %.2f"),
+                "Forecast_Ponderado": st.column_config.NumberColumn("Forecast ponderado", format="R$ %.2f"),
+                "Receita_Projetada_Bruta": st.column_config.NumberColumn("Projeção bruta", format="R$ %.2f"),
+                "Receita_Projetada_Ponderada": st.column_config.NumberColumn("Projeção ponderada", format="R$ %.2f"),
+                "Cobertura_Contratada": st.column_config.NumberColumn("% já contratado", format="%.1f%%"),
+            },
+        )
+
+        section("Matriz mensal · projeção ponderada")
+        matrix = revenue_monthly.pivot_table(index="Linha", columns="Competencia", values="Receita_Projetada_Ponderada", aggfunc="sum", fill_value=0)
+        for comp in [f"{APP_YEAR}-{m:02d}" for m in range(1, 13)]:
+            if comp not in matrix.columns:
+                matrix[comp] = 0.0
+        matrix = matrix[[f"{APP_YEAR}-{m:02d}" for m in range(1, 13)]].reset_index()
+        matrix["Linha"] = matrix["Linha"].map(line_label)
+        matrix = matrix.rename(columns={f"{APP_YEAR}-{m:02d}": MONTHS[m] for m in range(1, 13)})
+        matrix["Total"] = matrix[[MONTHS[m] for m in range(1, 13)]].sum(axis=1)
+        st.dataframe(
+            matrix,
+            hide_index=True,
+            width="stretch",
+            column_config={col: st.column_config.NumberColumn(format="R$ %.2f") for col in [MONTHS[m] for m in range(1, 13)] + ["Total"]},
+        )
+
+        section("Exportação da receita")
+        revenue_xlsx = export_revenue_excel(revenue_monthly, contracts_scope, forecast_scope)
+        st.download_button(
+            "Baixar Receita 2027 em Excel",
+            data=revenue_xlsx,
+            file_name=f"First_Budget_Receita_{APP_YEAR}_{norm(scope_choice).replace(' ', '_')}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            width="stretch",
+        )
+
+
+# =========================================================
 # PÁGINA: CARTEIRA ATIVA
 # =========================================================
 elif page == "Carteira Ativa":
@@ -1320,8 +2110,16 @@ elif page == "Carteira Ativa":
         st.warning(warning)
 
     carteira_scope = scope_active_contracts(active_contracts, scope_choice)
+    carteira_search = st.text_input(
+        "🔎 Buscar na carteira",
+        key="active_contracts_smart_search",
+        placeholder="Contrato, cliente, código, descrição, linha, grupo, gerente, vendedor...",
+        help="Use um ou vários termos. A busca também consulta os metadados do cadastro de produtos.",
+    )
+    if carteira_search:
+        carteira_scope = filter_budget_search(carteira_scope, carteira_search)
     if carteira_scope.empty:
-        st.info("Inclua a planilha de contratos ativos no mesmo repositório do app para carregar a carteira automaticamente.")
+        st.info("Nenhum contrato encontrado para este escopo/busca ou a planilha de contratos ativos ainda não foi carregada.")
     else:
         monthly_runrate = float(carteira_scope["Valor_Mensal_Base"].sum())
         receita_2027 = float(carteira_scope["Receita_2027_Planejada"].sum())
@@ -1383,6 +2181,9 @@ elif page == "Forecast Comercial":
     else:
         st.caption("BASE BI não localizada neste repositório. As listas usam apenas clientes e produtos já gravados no Budget.")
 
+    if scope_choice in {"CONSOLIDADO", "MICROTECH"}:
+        render_sulamita_history_reference(expanded=(scope_choice == "MICROTECH"))
+
     if can_edit:
         section("Novo lançamento")
         default_rev_idx = 1 if (not can_edit_all and user.get("linha") == "LOCACAO") else 0
@@ -1395,29 +2196,32 @@ elif page == "Forecast Comercial":
             help="Na locação, informe início, prazo e os equipamentos. O sistema soma as mensalidades dos itens e distribui a receita nas competências de 2027.",
         )
 
-        # Em vendas/serviços o cadastro pode ser extenso. A busca fica fora do formulário
-        # para filtrar a lista imediatamente enquanto o usuário digita.
-        sales_client_options = CLIENT_OPTIONS
-        sales_product_options = PRODUCT_OPTIONS
-        if new_revenue_type in {"Venda", "Serviço"}:
-            st.markdown("**Localizar cadastro**")
-            s1, s2 = st.columns(2)
-            with s1:
-                client_search = st.text_input(
-                    "🔎 Buscar cliente", key="sales_client_search",
-                    placeholder="Digite parte do nome do cliente",
-                    help="A busca ignora acentos e aceita mais de uma palavra.",
-                )
+        # Busca única para Venda, Serviço e Locação. O produto pode ser localizado por
+        # código, descrição, linha, grupo, segmento, fornecedor ou NCM.
+        st.markdown("**Localizar cadastro**")
+        s1, s2 = st.columns(2)
+        with s1:
+            client_search = st.text_input(
+                "🔎 Buscar cliente", key="new_client_smart_search",
+                placeholder="Nome, código, cidade, UF, vendedor, gerente...",
+                help="Digite um ou vários termos. A busca cruza todas as camadas disponíveis do cadastro.",
+            )
+            sales_client_options = _search_records(CLIENT_RECORDS, client_search, "value", limit=120)
+            if not CLIENT_RECORDS:
                 sales_client_options = filter_catalog_options(CLIENT_OPTIONS, client_search)
-                st.caption(f"{len(sales_client_options)} cliente(s) exibido(s)" + (" · refine a busca" if len(sales_client_options) >= 120 else ""))
-            with s2:
-                product_search = st.text_input(
-                    "🔎 Buscar produto", key="sales_product_search",
-                    placeholder="Digite código, descrição ou linha do produto",
-                    help="Pesquise por qualquer parte do código ou descrição.",
-                )
+            st.caption(f"{len(sales_client_options)} cliente(s) exibido(s)" + (" · refine a busca" if len(sales_client_options) >= 120 else ""))
+        with s2:
+            product_search = st.text_input(
+                "🔎 Buscar equipamento / produto", key="new_product_smart_search",
+                placeholder="Código, descrição, linha, grupo, segmento, fornecedor, NCM...",
+                help="Ex.: 'monitor microtech', um código parcial ou o nome do grupo. Todos os termos digitados precisam aparecer em alguma camada do cadastro.",
+            )
+            sales_product_options = _search_records(PRODUCT_RECORDS, product_search, "value", limit=120)
+            rental_product_options = _search_records(PRODUCT_RECORDS, product_search, "display", limit=120)
+            if not PRODUCT_RECORDS:
                 sales_product_options = filter_catalog_options(PRODUCT_OPTIONS, product_search)
-                st.caption(f"{len(sales_product_options)} produto(s) exibido(s)" + (" · refine a busca" if len(sales_product_options) >= 120 else ""))
+                rental_product_options = sales_product_options
+            st.caption(f"{len(sales_product_options)} produto(s) exibido(s)" + (" · refine a busca" if len(sales_product_options) >= 120 else ""))
 
         with st.form("new_forecast_form", clear_on_submit=True):
             a, b, c = st.columns(3)
@@ -1427,11 +2231,12 @@ elif page == "Forecast Comercial":
                 else:
                     new_line = user["linha"]
                     st.text_input("Linha de negócio", value=line_label(new_line), disabled=True)
-                base_client_choices = sales_client_options if new_revenue_type in {"Venda", "Serviço"} else CLIENT_OPTIONS
+                base_client_choices = sales_client_options
                 client_choices = base_client_choices + [NEW_CLIENT_OPTION]
                 cliente_selecionado = st.selectbox(
                     "Cliente *", client_choices,
                     index=0 if base_client_choices else len(client_choices) - 1,
+                    format_func=lambda value: CLIENT_VALUE_TO_DISPLAY.get(value, value),
                     help="Use a busca acima para reduzir a lista. Você também pode digitar dentro desta seleção.",
                 )
                 novo_cliente = st.text_input("Novo cliente", placeholder="Preencha somente se escolher + Novo cliente")
@@ -1457,11 +2262,19 @@ elif page == "Forecast Comercial":
                     "Equipamento": "", "Equipamento_Novo": "", "Quantidade": 1.0,
                     "Valor_Mensal_Unitario": 0.0, "Observacao_Item": ""
                 }])
+                preserved_equipment = _editor_selected_equipment_values("new_rental_items")
+                rental_choices = []
+                seen_rental = set()
+                for value in preserved_equipment + rental_product_options:
+                    key = norm(value)
+                    if value and key and key not in seen_rental:
+                        seen_rental.add(key)
+                        rental_choices.append(value)
                 equipment_cfg = (
                     st.column_config.SelectboxColumn(
-                        "Equipamento / produto *", options=[""] + PRODUCT_OPTIONS + [NEW_PRODUCT_OPTION], required=True,
-                        help="Pesquise no cadastro ou escolha + Novo equipamento / produto / oportunidade.",
-                    ) if PRODUCT_OPTIONS else st.column_config.TextColumn("Equipamento / produto *", required=True)
+                        "Equipamento / produto *", options=[""] + rental_choices + [NEW_PRODUCT_OPTION], required=True,
+                        help="A lista acima já foi filtrada pela busca inteligente. O rótulo mostra código/descrição e, quando disponível, Linha e Grupo.",
+                    ) if rental_choices else st.column_config.TextColumn("Equipamento / produto *", required=True)
                 )
                 itens_locacao = st.data_editor(
                     rental_seed, num_rows="dynamic", hide_index=True, width="stretch", key="new_rental_items",
@@ -1492,7 +2305,8 @@ elif page == "Forecast Comercial":
                     produto_selecionado = st.selectbox(
                         "Produto / linha / oportunidade", product_choices,
                         index=0 if sales_product_options else len(product_choices) - 1,
-                        help="Use a busca acima para localizar rapidamente por código ou descrição.",
+                        format_func=lambda value: PRODUCT_VALUE_TO_DISPLAY.get(value, value),
+                        help="Use a busca acima para localizar por código, descrição, linha, grupo, fornecedor ou NCM.",
                     )
                     produto_novo = st.text_input("Novo produto / oportunidade", placeholder="Preencha somente se não existir no cadastro")
                     produto = resolve_catalog_choice(produto_selecionado, produto_novo, NEW_PRODUCT_OPTION)
@@ -1619,6 +2433,12 @@ elif page == "Forecast Comercial":
         prob_filter = st.selectbox("Filtrar probabilidade", ["Todas"] + list(PROBABILITY_WEIGHTS.keys()))
     with f3:
         revenue_filter = st.selectbox("Filtrar tipo", ["Todos", "Venda", "Locação", "Serviço"])
+    forecast_search = st.text_input(
+        "🔎 Buscar nos lançamentos",
+        key="forecast_list_smart_search",
+        placeholder="Cliente, contrato, código, descrição, linha, grupo, equipamento, observação...",
+        help="Também localiza lançamentos pela Linha/Grupo do produto mesmo quando esses campos não foram gravados diretamente no forecast.",
+    )
 
     view = scoped.copy()
     if month_filter != "Todos":
@@ -1628,6 +2448,8 @@ elif page == "Forecast Comercial":
         view = view[view["Probabilidade"].eq(prob_filter)]
     if revenue_filter != "Todos":
         view = view[view["Tipo_Receita"].eq(revenue_filter)]
+    if forecast_search:
+        view = filter_budget_search(view, forecast_search)
 
     if view.empty:
         st.info("Nenhum forecast encontrado para os filtros selecionados.")
@@ -1677,6 +2499,27 @@ elif page == "Forecast Comercial":
                 index=rev_opts.index(current_rev) if current_rev in rev_opts else 0,
                 key=f"edit_revenue_type_{edit_id}",
             )
+            es1, es2 = st.columns(2)
+            with es1:
+                edit_client_search = st.text_input(
+                    "🔎 Buscar cliente para edição",
+                    key=f"edit_client_search_{edit_id}",
+                    placeholder="Nome, código, cidade, UF, vendedor, gerente...",
+                )
+                edit_client_matches = _search_records(CLIENT_RECORDS, edit_client_search, "value", limit=120)
+                if not CLIENT_RECORDS:
+                    edit_client_matches = filter_catalog_options(CLIENT_OPTIONS, edit_client_search)
+            with es2:
+                edit_product_search = st.text_input(
+                    "🔎 Buscar equipamento / produto para edição",
+                    key=f"edit_product_search_{edit_id}",
+                    placeholder="Código, descrição, linha, grupo, fornecedor, NCM...",
+                )
+                edit_product_matches = _search_records(PRODUCT_RECORDS, edit_product_search, "value", limit=120)
+                edit_product_display_matches = _search_records(PRODUCT_RECORDS, edit_product_search, "display", limit=120)
+                if not PRODUCT_RECORDS:
+                    edit_product_matches = filter_catalog_options(PRODUCT_OPTIONS, edit_product_search)
+                    edit_product_display_matches = edit_product_matches
 
             with st.form(f"edit_form_{edit_id}"):
                 a, b, c = st.columns(3)
@@ -1688,13 +2531,14 @@ elif page == "Forecast Comercial":
                         e_line = user["linha"]
                         st.text_input("Linha", line_label(e_line), disabled=True)
                     current_client = str(current.get("Cliente", "") or "").strip()
-                    edit_client_options = list(CLIENT_OPTIONS)
+                    edit_client_options = list(edit_client_matches)
                     if current_client and current_client not in edit_client_options:
-                        edit_client_options.append(current_client)
-                    edit_client_options = sorted(edit_client_options, key=lambda x: norm(x)) + [NEW_CLIENT_OPTION]
+                        edit_client_options.insert(0, current_client)
+                    edit_client_options = list(dict.fromkeys(edit_client_options)) + [NEW_CLIENT_OPTION]
                     e_cliente_selecionado = st.selectbox(
                         "Cliente", edit_client_options,
                         index=edit_client_options.index(current_client) if current_client in edit_client_options else len(edit_client_options) - 1,
+                        format_func=lambda value: CLIENT_VALUE_TO_DISPLAY.get(value, value),
                         help="Pesquise pelo cadastro existente ou escolha + Novo cliente.",
                     )
                     e_novo_cliente = st.text_input("Novo cliente", placeholder="Preencha somente se escolher + Novo cliente")
@@ -1726,11 +2570,13 @@ elif page == "Forecast Comercial":
                             "Equipamento": "", "Quantidade": 1.0, "Valor_Mensal_Unitario": 0.0, "Observacao_Item": ""
                         }], columns=CONTRACT_ITEM_COLUMNS)
                     legacy_items = legacy_items.copy()
+                    legacy_items["Equipamento"] = legacy_items["Equipamento"].map(lambda value: PRODUCT_VALUE_TO_DISPLAY.get(str(value), str(value)))
                     legacy_items["Equipamento_Novo"] = ""
                     extra_items = [str(x).strip() for x in legacy_items["Equipamento"].dropna().tolist() if str(x).strip()]
+                    preserved_edit = _editor_selected_equipment_values(f"edit_rental_items_{edit_id}")
                     edit_product_options = []
                     seen_products = set()
-                    for value in PRODUCT_OPTIONS + extra_items:
+                    for value in extra_items + preserved_edit + edit_product_display_matches:
                         key = norm(value)
                         if key and key not in seen_products:
                             seen_products.add(key)
@@ -1738,7 +2584,7 @@ elif page == "Forecast Comercial":
                     edit_equipment_cfg = (
                         st.column_config.SelectboxColumn(
                             "Equipamento / produto *", options=[""] + edit_product_options + [NEW_PRODUCT_OPTION], required=True,
-                            help="Pesquise no cadastro ou escolha + Novo equipamento / produto / oportunidade.",
+                            help="A lista respeita a busca inteligente por código, descrição, linha, grupo, fornecedor ou NCM.",
                         ) if edit_product_options else st.column_config.TextColumn("Equipamento / produto *", required=True)
                     )
                     e_items = st.data_editor(
@@ -1765,14 +2611,15 @@ elif page == "Forecast Comercial":
                         current_comp = str(current.get("Competencia", f"{APP_YEAR}-01"))
                         e_comp = st.selectbox("Mês", comps, index=comps.index(current_comp) if current_comp in comps else 0, format_func=month_label_from_comp)
                         current_product = str(current.get("Produto_Linha", "") or "").strip()
-                        edit_product_choices = list(PRODUCT_OPTIONS)
+                        edit_product_choices = list(edit_product_matches)
                         if current_product and current_product not in edit_product_choices:
-                            edit_product_choices.append(current_product)
-                        edit_product_choices = sorted(edit_product_choices, key=lambda x: norm(x)) + [NEW_PRODUCT_OPTION]
+                            edit_product_choices.insert(0, current_product)
+                        edit_product_choices = list(dict.fromkeys(edit_product_choices)) + [NEW_PRODUCT_OPTION]
                         e_produto_selecionado = st.selectbox(
                             "Produto / linha / oportunidade", edit_product_choices,
                             index=edit_product_choices.index(current_product) if current_product in edit_product_choices else len(edit_product_choices) - 1,
-                            help="Pesquise no cadastro existente ou escolha a opção de novo.",
+                            format_func=lambda value: PRODUCT_VALUE_TO_DISPLAY.get(value, value),
+                            help="Pesquise no cadastro por código, descrição, linha, grupo, fornecedor ou NCM.",
                         )
                         e_produto_novo = st.text_input("Novo produto / oportunidade", placeholder="Preencha somente se não existir no cadastro")
                         e_produto = resolve_catalog_choice(e_produto_selecionado, e_produto_novo, NEW_PRODUCT_OPTION)
@@ -1875,9 +2722,19 @@ elif page == "Forecast Comercial":
 # PÁGINA: CONSOLIDAÇÃO
 # =========================================================
 elif page == "Consolidação":
-    hero("Consolidação do Forecast", "A locação é distribuída mês a mês conforme a vigência; venda e serviço permanecem na competência informada.")
+    hero("Consolidação do Forecast Comercial", "Esta tela consolida somente as novas receitas previstas. A visão Carteira + Forecast está em Receita 2027.")
     scoped_raw = scope_df(active, scope_choice)
     scoped_monthly = scope_df(expand_monthly_forecast(active), scope_choice)
+    consolidation_search = st.text_input(
+        "🔎 Buscar antes de consolidar",
+        key="consolidation_smart_search",
+        placeholder="Cliente, contrato, código, descrição, linha, grupo, equipamento...",
+        help="A consolidação e a exportação passam a refletir somente os registros encontrados pela busca.",
+    )
+    if consolidation_search:
+        scoped_raw = filter_budget_search(scoped_raw, consolidation_search)
+        allowed_ids = set(scoped_raw["ID"].astype(str)) if not scoped_raw.empty else set()
+        scoped_monthly = scoped_monthly[scoped_monthly["ID"].astype(str).isin(allowed_ids)].copy()
 
     if scoped_raw.empty:
         st.info("Ainda não há forecast para consolidar neste escopo.")
@@ -1946,6 +2803,15 @@ elif page == "Histórico":
         h = h[h["Linha"].astype(str).map(norm).eq(user["linha"])]
     elif is_director and scope_choice != "CONSOLIDADO" and not h.empty:
         h = h[h["Linha"].astype(str).map(norm).eq(scope_choice)]
+
+    history_search = st.text_input(
+        "🔎 Buscar no histórico",
+        key="history_smart_search",
+        placeholder="Usuário, ação, ID, cliente, contrato, produto, código, observação...",
+        help="A busca inclui o conteúdo de Antes/Depois gravado em JSON.",
+    )
+    if history_search:
+        h = filter_dataframe_search(h, history_search)
 
     if h.empty:
         st.info("Nenhuma alteração registrada até o momento.")
