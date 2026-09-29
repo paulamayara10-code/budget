@@ -84,6 +84,15 @@ HISTORY_COLUMNS = [
     "Data_Hora", "Antes_JSON", "Depois_JSON",
 ]
 
+BUDGET_REVENUE_COLUMNS = [
+    "Ano", "Linha", "Competencia", "Budget_Proposto", "Budget_Aprovado",
+    "Status", "Justificativa", "Atualizado_Por", "Atualizado_Em",
+]
+BUDGET_REVENUE_HISTORY_COLUMNS = [
+    "Historico_ID", "Ano", "Linha", "Acao", "Usuario", "Data_Hora",
+    "Antes_JSON", "Depois_JSON",
+]
+
 ACTIVE_CONTRACT_OVERRIDE_COLUMNS = [
     "Contrato_Key", "Status_2027", "Meses_2027", "Valor_Mensal_Ajustado",
     "Linha_Budget", "Observacao_2027", "Atualizado_Por", "Atualizado_Em",
@@ -981,6 +990,90 @@ def build_revenue_summary_monthly(contract_monthly: pd.DataFrame, forecast_month
     return out
 
 
+@st.cache_data(show_spinner=False, ttl=120)
+def build_budget_revenue_basis(
+    contract_monthly: pd.DataFrame,
+    forecast_monthly: pd.DataFrame,
+    sulamita_detail: pd.DataFrame,
+    sulamita_avg_monthly: float,
+) -> pd.DataFrame:
+    """Monta a base sugerida do Budget de Receita sem alterar as fontes operacionais.
+
+    Regras:
+    - Locação: carteira contratada + forecast ponderado de novos contratos.
+    - Microtech: média histórica mensal dos clientes Sulamita + forecast ponderado dos
+      demais clientes. Forecast de clientes Sulamita já presentes no histórico fica
+      destacado e fora da base sugerida para evitar dupla contagem.
+    - Vendas/Endoscopia: forecast comercial ponderado.
+    """
+    grid = pd.MultiIndex.from_product(
+        [LINES, [f"{APP_YEAR}-{m:02d}" for m in range(1, 13)]],
+        names=["Linha", "Competencia"],
+    ).to_frame(index=False)
+
+    contracted = pd.DataFrame(columns=["Linha", "Competencia", "Receita_Contratada"])
+    if contract_monthly is not None and not contract_monthly.empty:
+        contracted = contract_monthly.groupby(["Linha", "Competencia"], as_index=False)["Receita_Contratada"].sum()
+
+    forecast = pd.DataFrame(columns=[
+        "Linha", "Competencia", "Forecast_Bruto", "Forecast_Ponderado",
+        "Forecast_Ponderado_Considerado", "Forecast_Sulamita_Excluido",
+    ])
+    if forecast_monthly is not None and not forecast_monthly.empty:
+        f = forecast_monthly.copy()
+        f["_CLIENTE_N"] = f.get("Cliente", "").fillna("").astype(str).map(norm)
+        sulamita_clients = set()
+        if sulamita_detail is not None and not sulamita_detail.empty and "Cliente" in sulamita_detail.columns:
+            sulamita_clients = {norm(x) for x in sulamita_detail["Cliente"].dropna().astype(str) if norm(x)}
+        f["_SULAMITA_HIST"] = f["Linha"].astype(str).map(norm).eq("MICROTECH") & f["_CLIENTE_N"].isin(sulamita_clients)
+        f["_FORECAST_CONSIDERADO"] = np.where(f["_SULAMITA_HIST"], 0.0, pd.to_numeric(f["Receita_Ponderada"], errors="coerce").fillna(0.0))
+        f["_FORECAST_SULAMITA_EXCLUIDO"] = np.where(f["_SULAMITA_HIST"], pd.to_numeric(f["Receita_Ponderada"], errors="coerce").fillna(0.0), 0.0)
+        forecast = f.groupby(["Linha", "Competencia"], as_index=False).agg(
+            Forecast_Bruto=("Receita_Prevista", "sum"),
+            Forecast_Ponderado=("Receita_Ponderada", "sum"),
+            Forecast_Ponderado_Considerado=("_FORECAST_CONSIDERADO", "sum"),
+            Forecast_Sulamita_Excluido=("_FORECAST_SULAMITA_EXCLUIDO", "sum"),
+        )
+
+    out = grid.merge(contracted, on=["Linha", "Competencia"], how="left")
+    out = out.merge(forecast, on=["Linha", "Competencia"], how="left")
+    numeric_cols = [
+        "Receita_Contratada", "Forecast_Bruto", "Forecast_Ponderado",
+        "Forecast_Ponderado_Considerado", "Forecast_Sulamita_Excluido",
+    ]
+    for col in numeric_cols:
+        if col not in out.columns:
+            out[col] = 0.0
+        out[col] = pd.to_numeric(out[col], errors="coerce").fillna(0.0)
+
+    out["Referencia_Historica"] = 0.0
+    out.loc[out["Linha"].eq("MICROTECH"), "Referencia_Historica"] = max(float(sulamita_avg_monthly or 0.0), 0.0)
+    out["Base_Sugerida"] = out["Receita_Contratada"] + out["Referencia_Historica"] + out["Forecast_Ponderado_Considerado"]
+    return out
+
+
+def merge_budget_revenue_overrides(basis: pd.DataFrame, saved: pd.DataFrame) -> pd.DataFrame:
+    """Aplica o orçamento gravado sobre a base dinâmica sem congelar as fontes."""
+    out = basis.copy()
+    if saved is not None and not saved.empty:
+        cols = [c for c in BUDGET_REVENUE_COLUMNS if c in saved.columns and c not in {"Ano"}]
+        out = out.merge(saved[cols], on=["Linha", "Competencia"], how="left")
+    for col in ["Budget_Proposto", "Budget_Aprovado"]:
+        if col not in out.columns:
+            out[col] = np.nan
+        out[col] = pd.to_numeric(out[col], errors="coerce")
+    # Enquanto a Controladoria ainda não gravou uma proposta, a base sugerida é o ponto de partida visual.
+    out["Budget_Proposto_Visual"] = out["Budget_Proposto"].where(out["Budget_Proposto"].notna(), out["Base_Sugerida"])
+    out["Budget_Aprovado"] = out["Budget_Aprovado"].fillna(0.0)
+    if "Status" not in out.columns:
+        out["Status"] = ""
+    out["Status"] = out["Status"].fillna("").astype(str).replace("", "EM ELABORAÇÃO")
+    if "Justificativa" not in out.columns:
+        out["Justificativa"] = ""
+    out["Justificativa"] = out["Justificativa"].fillna("").astype(str)
+    return out
+
+
 def save_active_contract_override(user: dict, row: pd.Series, status: str, months: int, monthly: float, line: str, note: str) -> None:
     latest = load_active_contract_overrides()
     key = str(row.get("Contrato_Key", ""))
@@ -1471,6 +1564,14 @@ def history_file() -> str:
     return f"historico_forecast_{APP_YEAR}.csv"
 
 
+def budget_revenue_file() -> str:
+    return f"budget_receita_{APP_YEAR}.csv"
+
+
+def budget_revenue_history_file() -> str:
+    return f"historico_budget_receita_{APP_YEAR}.csv"
+
+
 def load_forecast(fresh: bool = False) -> pd.DataFrame:
     df = load_table(forecast_file(), FORECAST_COLUMNS, fresh=fresh)
     numeric = [
@@ -1485,6 +1586,79 @@ def load_forecast(fresh: bool = False) -> pd.DataFrame:
 
 def load_history(fresh: bool = False) -> pd.DataFrame:
     return load_table(history_file(), HISTORY_COLUMNS, fresh=fresh)
+
+
+def load_budget_revenue(fresh: bool = False) -> pd.DataFrame:
+    df = load_table(budget_revenue_file(), BUDGET_REVENUE_COLUMNS, fresh=fresh)
+    for col in ["Ano", "Budget_Proposto", "Budget_Aprovado"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df["Ano"] = df["Ano"].fillna(APP_YEAR).astype(int)
+    return df
+
+
+def load_budget_revenue_history(fresh: bool = False) -> pd.DataFrame:
+    return load_table(budget_revenue_history_file(), BUDGET_REVENUE_HISTORY_COLUMNS, fresh=fresh)
+
+
+def append_budget_revenue_history(action: str, user: dict, line: str, before: list[dict], after: list[dict]) -> None:
+    hist = load_budget_revenue_history(fresh=True)
+    row = {
+        "Historico_ID": uuid.uuid4().hex[:12].upper(),
+        "Ano": APP_YEAR,
+        "Linha": norm(line),
+        "Acao": action,
+        "Usuario": user["nome"],
+        "Data_Hora": now_text(),
+        "Antes_JSON": json.dumps(before or [], ensure_ascii=False, default=str),
+        "Depois_JSON": json.dumps(after or [], ensure_ascii=False, default=str),
+    }
+    hist = pd.concat([hist, pd.DataFrame([row])], ignore_index=True)
+    save_table(budget_revenue_history_file(), hist[BUDGET_REVENUE_HISTORY_COLUMNS], f"First Budget: {action.lower()} budget receita {line}")
+
+
+def save_budget_revenue_line(user: dict, line: str, edited: pd.DataFrame, action: str = "SALVAR PROPOSTA") -> None:
+    """Grava somente a linha selecionada para não sobrescrever outras áreas."""
+    line = norm(line)
+    latest = load_budget_revenue(fresh=True)
+    before_df = latest[latest["Linha"].astype(str).map(norm).eq(line)].copy() if not latest.empty else pd.DataFrame(columns=BUDGET_REVENUE_COLUMNS)
+    before = before_df.to_dict("records")
+
+    keep = latest[~latest["Linha"].astype(str).map(norm).eq(line)].copy() if not latest.empty else pd.DataFrame(columns=BUDGET_REVENUE_COLUMNS)
+    rows = []
+    stamp = now_text()
+    for _, row in edited.iterrows():
+        rows.append({
+            "Ano": APP_YEAR,
+            "Linha": line,
+            "Competencia": str(row.get("Competencia", "")),
+            "Budget_Proposto": float(pd.to_numeric(pd.Series([row.get("Budget_Proposto")]), errors="coerce").fillna(0).iloc[0]),
+            "Budget_Aprovado": float(pd.to_numeric(pd.Series([row.get("Budget_Aprovado")]), errors="coerce").fillna(0).iloc[0]),
+            "Status": str(row.get("Status", "EM ELABORAÇÃO") or "EM ELABORAÇÃO"),
+            "Justificativa": str(row.get("Justificativa", "") or "").strip(),
+            "Atualizado_Por": user["nome"],
+            "Atualizado_Em": stamp,
+        })
+    new_line = pd.DataFrame(rows, columns=BUDGET_REVENUE_COLUMNS)
+    combined = pd.concat([keep, new_line], ignore_index=True)
+    save_table(budget_revenue_file(), combined[BUDGET_REVENUE_COLUMNS], f"First Budget: {action.lower()} {line}")
+    append_budget_revenue_history(action, user, line, before, new_line.to_dict("records"))
+
+
+def set_budget_revenue_status(user: dict, line: str, basis_view: pd.DataFrame, approved: bool) -> None:
+    line = norm(line)
+    frame = basis_view[basis_view["Linha"].astype(str).map(norm).eq(line)].copy()
+    if frame.empty:
+        raise RuntimeError("Não há base mensal para esta linha.")
+    if approved:
+        frame["Budget_Proposto"] = pd.to_numeric(frame["Budget_Proposto_Visual"], errors="coerce").fillna(0.0)
+        frame["Budget_Aprovado"] = frame["Budget_Proposto"]
+        frame["Status"] = "APROVADO"
+        action = "APROVAR BUDGET"
+    else:
+        frame["Budget_Proposto"] = pd.to_numeric(frame["Budget_Proposto_Visual"], errors="coerce").fillna(0.0)
+        frame["Status"] = "EM ELABORAÇÃO"
+        action = "REABRIR BUDGET"
+    save_budget_revenue_line(user, line, frame, action=action)
 
 
 def append_history(action: str, user: dict, forecast_id: str, line: str, before: dict | None, after: dict | None) -> None:
@@ -1680,6 +1854,51 @@ def export_revenue_excel(revenue_monthly: pd.DataFrame, contracts: pd.DataFrame,
     return out.getvalue()
 
 
+@st.cache_data(show_spinner=False, ttl=120)
+def export_budget_revenue_excel(view: pd.DataFrame) -> bytes:
+    out = io.BytesIO()
+    detail = view.copy()
+    if not detail.empty:
+        detail["Mês"] = detail["Competencia"].map(month_label_from_comp)
+        detail["Linha"] = detail["Linha"].map(line_label)
+        detail["Variação proposta x base"] = np.where(
+            detail["Base_Sugerida"].ne(0),
+            detail["Budget_Proposto_Visual"] / detail["Base_Sugerida"] - 1,
+            0.0,
+        )
+    annual = pd.DataFrame()
+    if not view.empty:
+        annual = view.groupby("Linha", as_index=False).agg(
+            Receita_Contratada=("Receita_Contratada", "sum"),
+            Referencia_Historica=("Referencia_Historica", "sum"),
+            Forecast_Considerado=("Forecast_Ponderado_Considerado", "sum"),
+            Forecast_Sulamita_Excluido=("Forecast_Sulamita_Excluido", "sum"),
+            Base_Sugerida=("Base_Sugerida", "sum"),
+            Budget_Proposto=("Budget_Proposto_Visual", "sum"),
+            Budget_Aprovado=("Budget_Aprovado", "sum"),
+        )
+        annual["Linha"] = annual["Linha"].map(line_label)
+    with pd.ExcelWriter(out, engine="xlsxwriter") as writer:
+        annual.to_excel(writer, index=False, sheet_name="Resumo Budget")
+        detail.to_excel(writer, index=False, sheet_name="Budget Mensal")
+        wb = writer.book
+        header = wb.add_format({"bold": True, "font_color": "white", "bg_color": NAVY})
+        money = wb.add_format({"num_format": 'R$ #,##0.00;[Red]-R$ #,##0.00'})
+        percent = wb.add_format({"num_format": "0.0%"})
+        for ws_name, frame in [("Resumo Budget", annual), ("Budget Mensal", detail)]:
+            ws = writer.sheets[ws_name]
+            for idx, col in enumerate(frame.columns):
+                ws.write(0, idx, col, header)
+                width = min(max(len(str(col)) + 3, 13), 42)
+                if "VARIACAO" in norm(col):
+                    ws.set_column(idx, idx, max(width, 18), percent)
+                elif any(x in norm(col) for x in ["VALOR", "RECEITA", "FORECAST", "BUDGET", "BASE", "REFERENCIA"]):
+                    ws.set_column(idx, idx, max(width, 18), money)
+                else:
+                    ws.set_column(idx, idx, width)
+    return out.getvalue()
+
+
 # =========================================================
 # ACESSO E ESCOPO
 # =========================================================
@@ -1734,7 +1953,7 @@ with st.sidebar:
         scope_choice = user["linha"]
         st.caption(f"Escopo: {line_label(scope_choice)}")
 
-    pages = ["Visão Geral", "Receita 2027", "Carteira Ativa", "Forecast Comercial", "Consolidação", "Histórico"]
+    pages = ["Visão Geral", "Receita 2027", "Budget de Receita", "Carteira Ativa", "Forecast Comercial", "Consolidação", "Histórico"]
     page = st.radio("Navegação", pages, label_visibility="collapsed")
 
     cfg = storage_config()
@@ -1747,6 +1966,8 @@ with st.sidebar:
         expand_monthly_forecast.clear()
         expand_active_contracts_monthly.clear()
         build_revenue_summary_monthly.clear()
+        build_budget_revenue_basis.clear()
+        export_budget_revenue_excel.clear()
         st.rerun()
     if cfg["mode"] == "github":
         st.caption(f"Persistência: GitHub ✓ · cache {TABLE_CACHE_TTL}s")
@@ -1759,8 +1980,10 @@ with st.sidebar:
 # =========================================================
 forecast = load_forecast()
 history = load_history() if page in {"Histórico", "Consolidação"} else pd.DataFrame(columns=HISTORY_COLUMNS)
+budget_revenue_saved = load_budget_revenue() if page in {"Budget de Receita", "Visão Geral"} else pd.DataFrame(columns=BUDGET_REVENUE_COLUMNS)
+budget_revenue_history = load_budget_revenue_history() if page == "Histórico" else pd.DataFrame(columns=BUDGET_REVENUE_HISTORY_COLUMNS)
 active = forecast[forecast["Status"].astype(str).str.upper().eq("ATIVO")].copy() if not forecast.empty else forecast.copy()
-input_catalog = build_input_catalog(forecast) if page != "Histórico" else {
+input_catalog = build_input_catalog(forecast) if page not in {"Histórico", "Budget de Receita"} else {
     "clients": [], "products": [], "client_types": {}, "client_records": [], "product_records": [],
     "master_client_count": 0, "master_product_count": 0, "source": "", "warning": "",
 }
@@ -1770,7 +1993,11 @@ CLIENT_TYPES = dict(input_catalog.get("client_types", {}))
 CLIENT_RECORDS = [dict(x) for x in input_catalog.get("client_records", [])]
 PRODUCT_RECORDS = [dict(x) for x in input_catalog.get("product_records", [])]
 
-active_contracts, active_contracts_meta = build_active_contracts_budget()
+if page in {"Receita 2027", "Budget de Receita", "Carteira Ativa", "Forecast Comercial"}:
+    active_contracts, active_contracts_meta = build_active_contracts_budget()
+else:
+    active_contracts = pd.DataFrame()
+    active_contracts_meta = {"source": "", "warning": ""}
 if not active_contracts.empty:
     contract_clients = [str(x).strip() for x in active_contracts["Cliente"].dropna().tolist() if str(x).strip()]
     contract_products = [str(x).strip() for x in active_contracts["Linha_Produto"].dropna().tolist() if str(x).strip()]
@@ -1801,7 +2028,7 @@ sulamita_history = {
     "detail": pd.DataFrame(), "monthly": pd.DataFrame(), "source": "", "warning": "",
     "start": "", "end": "", "months": 0, "avg_monthly": 0.0, "annual_projection": 0.0, "clients": 0,
 }
-if page in {"Receita 2027", "Forecast Comercial"} and scope_choice in {"CONSOLIDADO", "MICROTECH"}:
+if page in {"Receita 2027", "Budget de Receita", "Forecast Comercial"} and scope_choice in {"CONSOLIDADO", "MICROTECH"}:
     master_path_for_history = _master_base_path()
     if master_path_for_history is not None:
         sulamita_history = _read_sulamita_purchase_history(str(master_path_for_history), master_path_for_history.stat().st_mtime_ns)
@@ -1829,7 +2056,7 @@ if page == "Forecast Comercial":
     PRODUCT_DISPLAY_OPTIONS = [PRODUCT_VALUE_TO_DISPLAY.get(value, value) for value in PRODUCT_OPTIONS]
 
 active_scope = scope_df(active, scope_choice)
-needs_forecast_monthly = page in {"Visão Geral", "Receita 2027", "Consolidação"}
+needs_forecast_monthly = page in {"Visão Geral", "Receita 2027", "Budget de Receita", "Consolidação"}
 active_monthly = expand_monthly_forecast(active) if needs_forecast_monthly else pd.DataFrame(columns=FORECAST_COLUMNS)
 active_monthly_scope = scope_df(active_monthly, scope_choice) if needs_forecast_monthly else pd.DataFrame(columns=FORECAST_COLUMNS)
 
@@ -1930,6 +2157,25 @@ if page == "Visão Geral":
         kpi("Cobertura ponderada", pct(ponderado / bruto if bruto else 0), "Ponderado ÷ bruto")
     with c4:
         kpi("Clientes previstos", f"{clientes}", f"{registros} lançamentos ativos")
+
+    if budget_revenue_saved is not None and not budget_revenue_saved.empty:
+        budget_scope_saved = budget_revenue_saved.copy()
+        if not is_director:
+            budget_scope_saved = budget_scope_saved[budget_scope_saved["Linha"].astype(str).map(norm).eq(user["linha"])]
+        elif scope_choice != "CONSOLIDADO":
+            budget_scope_saved = budget_scope_saved[budget_scope_saved["Linha"].astype(str).map(norm).eq(scope_choice)]
+        if not budget_scope_saved.empty:
+            proposed_saved = float(pd.to_numeric(budget_scope_saved["Budget_Proposto"], errors="coerce").fillna(0).sum())
+            approved_saved = float(pd.to_numeric(budget_scope_saved["Budget_Aprovado"], errors="coerce").fillna(0).sum())
+            approved_lines = int(budget_scope_saved.loc[budget_scope_saved["Status"].astype(str).str.upper().eq("APROVADO"), "Linha"].nunique())
+            section("Budget de Receita")
+            b1, b2, b3 = st.columns(3)
+            with b1:
+                kpi("Budget proposto gravado", brl(proposed_saved), "Propostas já salvas pela Controladoria")
+            with b2:
+                kpi("Budget aprovado", brl(approved_saved), "Última versão oficial aprovada")
+            with b3:
+                kpi("Linhas aprovadas", f"{approved_lines}", "Das quatro linhas de negócio")
 
     section("Evolução mensal")
     if active_monthly_scope.empty:
@@ -2094,6 +2340,190 @@ elif page == "Receita 2027":
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             width="stretch",
         )
+
+
+# =========================================================
+# PÁGINA: BUDGET DE RECEITA
+# =========================================================
+elif page == "Budget de Receita":
+    hero("Budget de Receita 2027", "Transforma as bases já existentes em proposta orçamentária sem alterar Carteira Ativa ou Forecast Comercial.")
+
+    all_contract_monthly = expand_active_contracts_monthly(active_contracts)
+    all_forecast_monthly = expand_monthly_forecast(active)
+    sulamita_detail_budget = sulamita_history.get("detail", pd.DataFrame()) if isinstance(sulamita_history, dict) else pd.DataFrame()
+    sulamita_avg_budget = float(sulamita_history.get("avg_monthly", 0.0) or 0.0) if isinstance(sulamita_history, dict) else 0.0
+    budget_basis_all = build_budget_revenue_basis(
+        all_contract_monthly, all_forecast_monthly, sulamita_detail_budget, sulamita_avg_budget
+    )
+    budget_view_all = merge_budget_revenue_overrides(budget_basis_all, budget_revenue_saved)
+
+    if not is_director:
+        budget_view = budget_view_all[budget_view_all["Linha"].eq(user["linha"])].copy()
+    elif scope_choice != "CONSOLIDADO":
+        budget_view = budget_view_all[budget_view_all["Linha"].eq(scope_choice)].copy()
+    else:
+        budget_view = budget_view_all.copy()
+
+    budget_suggested = float(budget_view["Base_Sugerida"].sum()) if not budget_view.empty else 0.0
+    budget_proposed = float(budget_view["Budget_Proposto_Visual"].sum()) if not budget_view.empty else 0.0
+    budget_approved = float(budget_view["Budget_Aprovado"].sum()) if not budget_view.empty else 0.0
+    budget_gap = budget_proposed - budget_suggested
+
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        kpi("Base sugerida", brl(budget_suggested), "Contratos + referência histórica aplicável + forecast considerado")
+    with c2:
+        kpi("Budget proposto", brl(budget_proposed), "Valor em elaboração pela Controladoria")
+    with c3:
+        kpi("Budget aprovado", brl(budget_approved), "Última versão aprovada")
+    with c4:
+        kpi("Ajuste vs. base", brl(budget_gap), pct(budget_gap / budget_suggested) if budget_suggested else "Sem base comparável")
+
+    section("Composição da base sugerida")
+    annual_budget = budget_view.groupby("Linha", as_index=False).agg(
+        Receita_Contratada=("Receita_Contratada", "sum"),
+        Referencia_Historica=("Referencia_Historica", "sum"),
+        Forecast_Considerado=("Forecast_Ponderado_Considerado", "sum"),
+        Forecast_Sulamita_Excluido=("Forecast_Sulamita_Excluido", "sum"),
+        Base_Sugerida=("Base_Sugerida", "sum"),
+        Budget_Proposto=("Budget_Proposto_Visual", "sum"),
+        Budget_Aprovado=("Budget_Aprovado", "sum"),
+    ) if not budget_view.empty else pd.DataFrame()
+    if not annual_budget.empty:
+        status_by_line = (budget_view.groupby("Linha")["Status"].apply(lambda s: "APROVADO" if len(s) and s.astype(str).str.upper().eq("APROVADO").all() else "EM ELABORAÇÃO").to_dict())
+        annual_budget["Status"] = annual_budget["Linha"].map(status_by_line)
+        annual_budget["Ajuste_vs_Base"] = np.where(annual_budget["Base_Sugerida"].ne(0), annual_budget["Budget_Proposto"] / annual_budget["Base_Sugerida"] - 1, 0.0)
+        annual_budget["Linha"] = annual_budget["Linha"].map(line_label)
+        st.dataframe(
+            annual_budget, hide_index=True, width="stretch",
+            column_config={
+                "Receita_Contratada": st.column_config.NumberColumn("Contratada", format="R$ %.2f"),
+                "Referencia_Historica": st.column_config.NumberColumn("Ref. histórica", format="R$ %.2f"),
+                "Forecast_Considerado": st.column_config.NumberColumn("Forecast considerado", format="R$ %.2f"),
+                "Forecast_Sulamita_Excluido": st.column_config.NumberColumn("Forecast Sulamita separado", format="R$ %.2f"),
+                "Base_Sugerida": st.column_config.NumberColumn("Base sugerida", format="R$ %.2f"),
+                "Budget_Proposto": st.column_config.NumberColumn("Budget proposto", format="R$ %.2f"),
+                "Budget_Aprovado": st.column_config.NumberColumn("Budget aprovado", format="R$ %.2f"),
+                "Ajuste_vs_Base": st.column_config.NumberColumn("Ajuste x base", format="%.1f%%"),
+            },
+        )
+
+    st.markdown(
+        "<div class='storage-note'><b>Regra Microtech:</b> a média histórica dos clientes Sulamita entra como base recorrente. "
+        "Forecast lançado para um cliente Sulamita que já possui histórico fica separado da base sugerida para evitar dupla contagem. "
+        "Se o forecast for realmente incremental, a Controladoria incorpora o aumento no Budget Proposto.</div>",
+        unsafe_allow_html=True,
+    )
+
+    section("Planejamento mensal")
+    available_budget_lines = [ln for ln in LINES if not budget_view_all[budget_view_all["Linha"].eq(ln)].empty]
+    if is_director and scope_choice in LINES:
+        available_budget_lines = [scope_choice]
+    if is_director:
+        default_line = scope_choice if scope_choice in LINES else (available_budget_lines[0] if available_budget_lines else "MICROTECH")
+        detail_line = st.selectbox("Linha para detalhar", available_budget_lines or LINES, index=(available_budget_lines or LINES).index(default_line) if default_line in (available_budget_lines or LINES) else 0, format_func=line_label)
+    else:
+        detail_line = user["linha"]
+        st.caption(f"Linha: {line_label(detail_line)}")
+
+    line_view = budget_view_all[budget_view_all["Linha"].eq(detail_line)].sort_values("Competencia").copy()
+    line_status = "APROVADO" if not line_view.empty and line_view["Status"].astype(str).str.upper().eq("APROVADO").all() else "EM ELABORAÇÃO"
+    st.markdown(f"<span class='pill'>{line_label(detail_line)} · {line_status}</span>", unsafe_allow_html=True)
+
+    monthly_edit = line_view[[
+        "Competencia", "Receita_Contratada", "Referencia_Historica",
+        "Forecast_Ponderado_Considerado", "Forecast_Sulamita_Excluido",
+        "Base_Sugerida", "Budget_Proposto_Visual", "Budget_Aprovado", "Status", "Justificativa"
+    ]].copy()
+    monthly_edit["Mês"] = monthly_edit["Competencia"].map(month_label_from_comp)
+    monthly_edit = monthly_edit.rename(columns={"Budget_Proposto_Visual": "Budget_Proposto"})
+    monthly_edit["Ajuste_%"] = np.where(
+        monthly_edit["Base_Sugerida"].ne(0), monthly_edit["Budget_Proposto"] / monthly_edit["Base_Sugerida"] - 1, 0.0
+    )
+    monthly_edit = monthly_edit[[
+        "Competencia", "Mês", "Receita_Contratada", "Referencia_Historica",
+        "Forecast_Ponderado_Considerado", "Forecast_Sulamita_Excluido",
+        "Base_Sugerida", "Budget_Proposto", "Ajuste_%", "Budget_Aprovado", "Status", "Justificativa"
+    ]]
+
+    if is_controladoria and line_status != "APROVADO":
+        edited_budget = st.data_editor(
+            monthly_edit, hide_index=True, width="stretch", key=f"budget_revenue_editor_{detail_line}",
+            disabled=[
+                "Competencia", "Mês", "Receita_Contratada", "Referencia_Historica",
+                "Forecast_Ponderado_Considerado", "Forecast_Sulamita_Excluido",
+                "Base_Sugerida", "Ajuste_%", "Budget_Aprovado", "Status",
+            ],
+            column_config={
+                "Competencia": None,
+                "Receita_Contratada": st.column_config.NumberColumn("Contratada", format="R$ %.2f"),
+                "Referencia_Historica": st.column_config.NumberColumn("Ref. histórica", format="R$ %.2f"),
+                "Forecast_Ponderado_Considerado": st.column_config.NumberColumn("Forecast considerado", format="R$ %.2f"),
+                "Forecast_Sulamita_Excluido": st.column_config.NumberColumn("Sulamita separado", format="R$ %.2f"),
+                "Base_Sugerida": st.column_config.NumberColumn("Base sugerida", format="R$ %.2f"),
+                "Budget_Proposto": st.column_config.NumberColumn("Budget proposto", min_value=0.0, step=1000.0, format="R$ %.2f"),
+                "Ajuste_%": st.column_config.NumberColumn("Ajuste x base", format="%.1f%%"),
+                "Budget_Aprovado": st.column_config.NumberColumn("Aprovado", format="R$ %.2f"),
+                "Justificativa": st.column_config.TextColumn("Justificativa / premissa"),
+            },
+        )
+        b1, b2 = st.columns(2)
+        with b1:
+            if st.button("Salvar proposta", width="stretch", type="secondary"):
+                payload = edited_budget.copy()
+                payload["Status"] = "EM ELABORAÇÃO"
+                try:
+                    save_budget_revenue_line(user, detail_line, payload, action="SALVAR PROPOSTA")
+                    st.success("Budget proposto salvo sem alterar as bases de origem.")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Não foi possível salvar o Budget: {exc}")
+        with b2:
+            approve_confirm = st.checkbox("Confirmo a aprovação desta linha", key=f"approve_budget_{detail_line}")
+            if st.button("Aprovar Budget da linha", width="stretch", type="primary", disabled=not approve_confirm):
+                payload = edited_budget.copy()
+                payload["Status"] = "APROVADO"
+                payload["Budget_Aprovado"] = pd.to_numeric(payload["Budget_Proposto"], errors="coerce").fillna(0.0)
+                try:
+                    save_budget_revenue_line(user, detail_line, payload, action="APROVAR BUDGET")
+                    st.success(f"Budget de {line_label(detail_line)} aprovado.")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Não foi possível aprovar o Budget: {exc}")
+    else:
+        st.dataframe(
+            monthly_edit, hide_index=True, width="stretch",
+            column_config={
+                "Competencia": None,
+                "Receita_Contratada": st.column_config.NumberColumn("Contratada", format="R$ %.2f"),
+                "Referencia_Historica": st.column_config.NumberColumn("Ref. histórica", format="R$ %.2f"),
+                "Forecast_Ponderado_Considerado": st.column_config.NumberColumn("Forecast considerado", format="R$ %.2f"),
+                "Forecast_Sulamita_Excluido": st.column_config.NumberColumn("Sulamita separado", format="R$ %.2f"),
+                "Base_Sugerida": st.column_config.NumberColumn("Base sugerida", format="R$ %.2f"),
+                "Budget_Proposto": st.column_config.NumberColumn("Budget proposto", format="R$ %.2f"),
+                "Ajuste_%": st.column_config.NumberColumn("Ajuste x base", format="%.1f%%"),
+                "Budget_Aprovado": st.column_config.NumberColumn("Aprovado", format="R$ %.2f"),
+            },
+        )
+        if is_controladoria and line_status == "APROVADO":
+            if st.button("Reabrir Budget desta linha", width="stretch", type="secondary"):
+                try:
+                    set_budget_revenue_status(user, detail_line, budget_view_all, approved=False)
+                    st.success("Budget reaberto para edição. A última versão aprovada permanece registrada até nova aprovação.")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Não foi possível reabrir: {exc}")
+
+    section("Exportação")
+    budget_export_scope = budget_view.copy()
+    budget_xlsx = export_budget_revenue_excel(budget_export_scope)
+    st.download_button(
+        "Baixar Budget de Receita em Excel",
+        data=budget_xlsx,
+        file_name=f"First_Budget_Receita_Oficial_{APP_YEAR}_{norm(scope_choice).replace(' ', '_')}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        width="stretch",
+    )
 
 
 # =========================================================
@@ -2839,6 +3269,22 @@ elif page == "Histórico":
                     st.json(json.loads(str(audit["Depois_JSON"])))
                 except Exception:
                     st.code(str(audit["Depois_JSON"]))
+
+    section("Histórico do Budget de Receita")
+    hb = budget_revenue_history.copy()
+    if not is_director and not hb.empty:
+        hb = hb[hb["Linha"].astype(str).map(norm).eq(user["linha"])].copy()
+    elif is_director and scope_choice != "CONSOLIDADO" and not hb.empty:
+        hb = hb[hb["Linha"].astype(str).map(norm).eq(scope_choice)].copy()
+    if hb.empty:
+        st.caption("Ainda não há alterações gravadas no Budget de Receita.")
+    else:
+        hb["_ordem"] = pd.to_datetime(hb["Data_Hora"], format="%d/%m/%Y %H:%M:%S", errors="coerce")
+        hb = hb.sort_values("_ordem", ascending=False).drop(columns=["_ordem"])
+        hb_show = hb[["Data_Hora", "Acao", "Usuario", "Linha"]].copy()
+        hb_show["Linha"] = hb_show["Linha"].map(line_label)
+        hb_show = hb_show.rename(columns={"Data_Hora": "Data / hora", "Acao": "Ação", "Usuario": "Usuário"})
+        st.dataframe(hb_show, width="stretch", hide_index=True)
 
 
 # =========================================================
