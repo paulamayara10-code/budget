@@ -93,6 +93,38 @@ BUDGET_REVENUE_HISTORY_COLUMNS = [
     "Antes_JSON", "Depois_JSON",
 ]
 
+PREMISES_COLUMNS = [
+    "Premissa_ID", "Ano", "Grupo", "Premissa", "Valor", "Unidade",
+    "Observacao", "Atualizado_Por", "Atualizado_Em",
+]
+PREMISES_HISTORY_COLUMNS = [
+    "Historico_ID", "Ano", "Acao", "Usuario", "Data_Hora",
+    "Antes_JSON", "Depois_JSON",
+]
+
+DEFAULT_PREMISES = [
+    ("GERAL_INFLACAO", "GERAL", "Inflação projetada", "%"),
+    ("GERAL_REAJUSTE_SALARIAL", "GERAL", "Reajuste salarial médio", "%"),
+    ("GERAL_CUSTO_FINANCEIRO", "GERAL", "Custo financeiro médio", "% a.m."),
+    ("MICROTECH_CAMBIO", "MICROTECH", "Dólar orçamento", "R$/US$"),
+    ("MICROTECH_REAJUSTE_PRECO", "MICROTECH", "Reajuste médio da tabela de preços", "%"),
+    ("MICROTECH_MARGEM", "MICROTECH", "Margem alvo", "%"),
+    ("MICROTECH_TRIBUTOS", "MICROTECH", "Carga tributária sobre vendas", "%"),
+    ("MICROTECH_DESP_COMISSOES", "MICROTECH", "Despesas e comissões sobre vendas", "%"),
+    ("LOCACAO_REAJUSTE", "LOCACAO", "Reajuste médio dos contratos", "%"),
+    ("LOCACAO_MARGEM", "LOCACAO", "Margem alvo", "%"),
+    ("LOCACAO_TRIBUTOS", "LOCACAO", "Carga tributária sobre locação", "%"),
+    ("LOCACAO_PERDA", "LOCACAO", "Perda / inadimplência esperada", "%"),
+    ("VENDAS_REAJUSTE_PRECO", "VENDAS", "Reajuste médio da tabela de preços", "%"),
+    ("VENDAS_MARGEM", "VENDAS", "Margem alvo", "%"),
+    ("VENDAS_TRIBUTOS", "VENDAS", "Carga tributária sobre vendas", "%"),
+    ("VENDAS_COMISSAO", "VENDAS", "Comissão média", "%"),
+    ("ENDOSCOPIA_REAJUSTE_PRECO", "ENDOSCOPIA", "Reajuste médio da tabela de preços", "%"),
+    ("ENDOSCOPIA_MARGEM", "ENDOSCOPIA", "Margem alvo", "%"),
+    ("ENDOSCOPIA_TRIBUTOS", "ENDOSCOPIA", "Carga tributária sobre vendas/serviços", "%"),
+    ("ENDOSCOPIA_COMISSAO", "ENDOSCOPIA", "Comissão média", "%"),
+]
+
 ACTIVE_CONTRACT_OVERRIDE_COLUMNS = [
     "Contrato_Key", "Status_2027", "Meses_2027", "Valor_Mensal_Ajustado",
     "Linha_Budget", "Observacao_2027", "Atualizado_Por", "Atualizado_Em",
@@ -323,7 +355,7 @@ def _read_sulamita_purchase_history(path_text: str, modified_ns: int) -> dict[st
             if seller_col is None: missing.append("vendedor/representante")
             if value_col is None: missing.append("valor")
             if month_col is None and date_col is None: missing.append("mês/data")
-            empty["warning"] = "Não foi possível calcular a média Sulamita: faltam colunas de " + ", ".join(missing) + "."
+            empty["warning"] = "Não foi possível calcular a média dos distribuidores: faltam colunas de " + ", ".join(missing) + "."
             return empty
         usecols = []
         for col in [client_col, seller_col, month_col, date_col, value_col, manager_col, segment_col]:
@@ -331,13 +363,13 @@ def _read_sulamita_purchase_history(path_text: str, modified_ns: int) -> dict[st
                 usecols.append(col)
         df = pd.read_excel(path, sheet_name="BANCO DE DADOS FATURAMENTO", engine="openpyxl", usecols=usecols)
     except Exception as exc:
-        empty["warning"] = f"Não foi possível ler o histórico Sulamita: {exc}"
+        empty["warning"] = f"Não foi possível ler o histórico dos distribuidores: {exc}"
         return empty
 
     seller_n = df[seller_col].fillna("").astype(str).map(norm)
     sulamita = df[seller_n.str.contains("SULAMITA", regex=False, na=False)].copy()
     if sulamita.empty:
-        empty["warning"] = "Nenhum faturamento da Sulamita foi localizado na BASE BI."
+        empty["warning"] = "Nenhum faturamento dos distribuidores foi localizado na BASE BI."
         return empty
 
     official = _to_month_period_series(sulamita[month_col]) if month_col else pd.Series(pd.NaT, index=sulamita.index)
@@ -353,7 +385,7 @@ def _read_sulamita_purchase_history(path_text: str, modified_ns: int) -> dict[st
         & sulamita["_MES"].map(lambda p: p.year if isinstance(p, pd.Period) else 9999).lt(APP_YEAR)
     ].copy()
     if sulamita.empty:
-        empty["warning"] = f"Não há histórico Sulamita anterior a {APP_YEAR} com competência válida."
+        empty["warning"] = f"Não há histórico de distribuidores anterior a {APP_YEAR} com competência válida."
         return empty
 
     end = sulamita["_MES"].max()
@@ -1001,8 +1033,8 @@ def build_budget_revenue_basis(
 
     Regras:
     - Locação: carteira contratada + forecast ponderado de novos contratos.
-    - Microtech: média histórica mensal dos clientes Sulamita + forecast ponderado dos
-      demais clientes. Forecast de clientes Sulamita já presentes no histórico fica
+    - Microtech: média histórica mensal dos distribuidores + forecast ponderado dos
+      demais clientes. Forecast de distribuidores já presentes no histórico fica
       destacado e fora da base sugerida para evitar dupla contagem.
     - Vendas/Endoscopia: forecast comercial ponderado.
     """
@@ -1572,6 +1604,70 @@ def budget_revenue_history_file() -> str:
     return f"historico_budget_receita_{APP_YEAR}.csv"
 
 
+def premises_file() -> str:
+    return f"premissas_{APP_YEAR}.csv"
+
+
+def premises_history_file() -> str:
+    return f"historico_premissas_{APP_YEAR}.csv"
+
+
+def default_premises_df() -> pd.DataFrame:
+    rows = []
+    for premise_id, group, premise, unit in DEFAULT_PREMISES:
+        rows.append({
+            "Premissa_ID": premise_id, "Ano": APP_YEAR, "Grupo": group,
+            "Premissa": premise, "Valor": np.nan, "Unidade": unit,
+            "Observacao": "", "Atualizado_Por": "", "Atualizado_Em": "",
+        })
+    return pd.DataFrame(rows, columns=PREMISES_COLUMNS)
+
+
+def load_premises(fresh: bool = False) -> pd.DataFrame:
+    saved = load_table(premises_file(), PREMISES_COLUMNS, fresh=fresh)
+    defaults = default_premises_df()
+    if saved.empty:
+        return defaults
+    saved = saved.copy()
+    saved["Valor"] = pd.to_numeric(saved["Valor"], errors="coerce")
+    saved["Ano"] = pd.to_numeric(saved["Ano"], errors="coerce").fillna(APP_YEAR).astype(int)
+    # Mantém a estrutura-padrão e preserva eventuais premissas adicionais já gravadas.
+    saved_ids = set(saved["Premissa_ID"].astype(str))
+    missing = defaults[~defaults["Premissa_ID"].astype(str).isin(saved_ids)]
+    return pd.concat([saved, missing], ignore_index=True)[PREMISES_COLUMNS]
+
+
+def load_premises_history(fresh: bool = False) -> pd.DataFrame:
+    return load_table(premises_history_file(), PREMISES_HISTORY_COLUMNS, fresh=fresh)
+
+
+def save_premises(user: dict, edited: pd.DataFrame) -> None:
+    latest = load_premises(fresh=True)
+    before = latest.to_dict("records")
+    frame = edited.copy()
+    for col in PREMISES_COLUMNS:
+        if col not in frame.columns:
+            frame[col] = ""
+    frame["Ano"] = APP_YEAR
+    frame["Valor"] = pd.to_numeric(frame["Valor"], errors="coerce")
+    stamp = now_text()
+    frame["Atualizado_Por"] = user["nome"]
+    frame["Atualizado_Em"] = stamp
+    frame = frame[PREMISES_COLUMNS]
+    save_table(premises_file(), frame, f"First Budget: atualizar premissas {APP_YEAR}")
+
+    hist = load_premises_history(fresh=True)
+    row = {
+        "Historico_ID": uuid.uuid4().hex[:12].upper(),
+        "Ano": APP_YEAR, "Acao": "ATUALIZAR PREMISSAS", "Usuario": user["nome"],
+        "Data_Hora": stamp,
+        "Antes_JSON": json.dumps(before, ensure_ascii=False, default=str),
+        "Depois_JSON": json.dumps(frame.to_dict("records"), ensure_ascii=False, default=str),
+    }
+    hist = pd.concat([hist, pd.DataFrame([row])], ignore_index=True)
+    save_table(premises_history_file(), hist[PREMISES_HISTORY_COLUMNS], f"First Budget: histórico premissas {APP_YEAR}")
+
+
 def load_forecast(fresh: bool = False) -> pd.DataFrame:
     df = load_table(forecast_file(), FORECAST_COLUMNS, fresh=fresh)
     numeric = [
@@ -1953,7 +2049,7 @@ with st.sidebar:
         scope_choice = user["linha"]
         st.caption(f"Escopo: {line_label(scope_choice)}")
 
-    pages = ["Visão Geral", "Receita 2027", "Budget de Receita", "Carteira Ativa", "Forecast Comercial", "Consolidação", "Histórico"]
+    pages = ["Visão Geral", "Receita 2027", "Budget de Receita", "Premissas 2027", "Carteira Ativa", "Forecast Comercial", "Consolidação", "Histórico"]
     page = st.radio("Navegação", pages, label_visibility="collapsed")
 
     cfg = storage_config()
@@ -1978,12 +2074,14 @@ with st.sidebar:
 # =========================================================
 # DADOS
 # =========================================================
-forecast = load_forecast()
+forecast = load_forecast() if page != "Premissas 2027" else pd.DataFrame(columns=FORECAST_COLUMNS)
 history = load_history() if page in {"Histórico", "Consolidação"} else pd.DataFrame(columns=HISTORY_COLUMNS)
 budget_revenue_saved = load_budget_revenue() if page in {"Budget de Receita", "Visão Geral"} else pd.DataFrame(columns=BUDGET_REVENUE_COLUMNS)
 budget_revenue_history = load_budget_revenue_history() if page == "Histórico" else pd.DataFrame(columns=BUDGET_REVENUE_HISTORY_COLUMNS)
+premises = load_premises() if page in {"Premissas 2027", "Visão Geral"} else pd.DataFrame(columns=PREMISES_COLUMNS)
+premises_history = load_premises_history() if page == "Histórico" else pd.DataFrame(columns=PREMISES_HISTORY_COLUMNS)
 active = forecast[forecast["Status"].astype(str).str.upper().eq("ATIVO")].copy() if not forecast.empty else forecast.copy()
-input_catalog = build_input_catalog(forecast) if page not in {"Histórico", "Budget de Receita"} else {
+input_catalog = build_input_catalog(forecast) if page not in {"Histórico", "Budget de Receita", "Premissas 2027"} else {
     "clients": [], "products": [], "client_types": {}, "client_records": [], "product_records": [],
     "master_client_count": 0, "master_product_count": 0, "source": "", "warning": "",
 }
@@ -2063,35 +2161,35 @@ active_monthly_scope = scope_df(active_monthly, scope_choice) if needs_forecast_
 
 
 def render_sulamita_history_reference(expanded: bool = False) -> None:
-    """Exibe a referência histórica dos clientes Sulamita sem somá-la ao forecast atual."""
+    """Exibe a referência histórica dos distribuidores sem somá-la ao forecast atual."""
     detail = sulamita_history.get("detail", pd.DataFrame())
     warning = str(sulamita_history.get("warning", "") or "")
-    with st.expander("Microtech · referência histórica dos clientes Sulamita", expanded=expanded):
+    with st.expander("Microtech · referência histórica dos distribuidores", expanded=expanded):
         st.caption(
             "Base automática para planejamento: média mensal dos últimos meses disponíveis, incluindo meses sem compra. "
-            "Esta referência não é somada ao forecast comercial, evitando duplicidade antes da definição do Budget de Receita."
+            "Esta referência de distribuidores não é somada ao forecast comercial, evitando duplicidade antes da definição do Budget de Receita."
         )
         if warning:
             st.warning(warning)
             return
         if detail is None or detail.empty:
-            st.info("Ainda não há histórico suficiente para calcular a referência Sulamita.")
+            st.info("Ainda não há histórico suficiente para calcular a referência dos distribuidores.")
             return
 
         months = int(sulamita_history.get("months", 0) or 0)
         period_text = f"{month_label_from_comp(str(sulamita_history.get('start', '')))} a {month_label_from_comp(str(sulamita_history.get('end', '')))}"
         c1, c2, c3, c4 = st.columns(4)
         with c1:
-            kpi("Média mensal Sulamita", brl(float(sulamita_history.get("avg_monthly", 0.0))), f"{months} mês(es) na base")
+            kpi("Média mensal dos distribuidores", brl(float(sulamita_history.get("avg_monthly", 0.0))), f"{months} mês(es) na base")
         with c2:
             kpi("Referência anual 2027", brl(float(sulamita_history.get("annual_projection", 0.0))), "Média mensal × 12")
         with c3:
-            kpi("Clientes com histórico", f"{int(sulamita_history.get('clients', 0) or 0)}", "Clientes atendidos pela Sulamita")
+            kpi("Distribuidores com histórico", f"{int(sulamita_history.get('clients', 0) or 0)}", "Distribuidores identificados na base histórica")
         with c4:
             kpi("Período analisado", period_text, "Últimos meses disponíveis")
 
         q = st.text_input(
-            "🔎 Buscar cliente na referência Sulamita",
+            "🔎 Buscar distribuidor na referência histórica",
             key=f"sulamita_reference_search_{'expanded' if expanded else 'collapsed'}",
             placeholder="Nome ou parte do cliente...",
         )
@@ -2400,7 +2498,7 @@ elif page == "Budget de Receita":
                 "Receita_Contratada": st.column_config.NumberColumn("Contratada", format="R$ %.2f"),
                 "Referencia_Historica": st.column_config.NumberColumn("Ref. histórica", format="R$ %.2f"),
                 "Forecast_Considerado": st.column_config.NumberColumn("Forecast considerado", format="R$ %.2f"),
-                "Forecast_Sulamita_Excluido": st.column_config.NumberColumn("Forecast Sulamita separado", format="R$ %.2f"),
+                "Forecast_Sulamita_Excluido": st.column_config.NumberColumn("Forecast distribuidores separado", format="R$ %.2f"),
                 "Base_Sugerida": st.column_config.NumberColumn("Base sugerida", format="R$ %.2f"),
                 "Budget_Proposto": st.column_config.NumberColumn("Budget proposto", format="R$ %.2f"),
                 "Budget_Aprovado": st.column_config.NumberColumn("Budget aprovado", format="R$ %.2f"),
@@ -2409,8 +2507,8 @@ elif page == "Budget de Receita":
         )
 
     st.markdown(
-        "<div class='storage-note'><b>Regra Microtech:</b> a média histórica dos clientes Sulamita entra como base recorrente. "
-        "Forecast lançado para um cliente Sulamita que já possui histórico fica separado da base sugerida para evitar dupla contagem. "
+        "<div class='storage-note'><b>Regra Microtech:</b> a média histórica dos distribuidores entra como base recorrente. "
+        "Forecast lançado para um distribuidor que já possui histórico fica separado da base sugerida para evitar dupla contagem. "
         "Se o forecast for realmente incremental, a Controladoria incorpora o aumento no Budget Proposto.</div>",
         unsafe_allow_html=True,
     )
@@ -2459,7 +2557,7 @@ elif page == "Budget de Receita":
                 "Receita_Contratada": st.column_config.NumberColumn("Contratada", format="R$ %.2f"),
                 "Referencia_Historica": st.column_config.NumberColumn("Ref. histórica", format="R$ %.2f"),
                 "Forecast_Ponderado_Considerado": st.column_config.NumberColumn("Forecast considerado", format="R$ %.2f"),
-                "Forecast_Sulamita_Excluido": st.column_config.NumberColumn("Sulamita separado", format="R$ %.2f"),
+                "Forecast_Sulamita_Excluido": st.column_config.NumberColumn("Distribuidores separados", format="R$ %.2f"),
                 "Base_Sugerida": st.column_config.NumberColumn("Base sugerida", format="R$ %.2f"),
                 "Budget_Proposto": st.column_config.NumberColumn("Budget proposto", min_value=0.0, step=1000.0, format="R$ %.2f"),
                 "Ajuste_%": st.column_config.NumberColumn("Ajuste x base", format="%.1f%%"),
@@ -2498,7 +2596,7 @@ elif page == "Budget de Receita":
                 "Receita_Contratada": st.column_config.NumberColumn("Contratada", format="R$ %.2f"),
                 "Referencia_Historica": st.column_config.NumberColumn("Ref. histórica", format="R$ %.2f"),
                 "Forecast_Ponderado_Considerado": st.column_config.NumberColumn("Forecast considerado", format="R$ %.2f"),
-                "Forecast_Sulamita_Excluido": st.column_config.NumberColumn("Sulamita separado", format="R$ %.2f"),
+                "Forecast_Sulamita_Excluido": st.column_config.NumberColumn("Distribuidores separados", format="R$ %.2f"),
                 "Base_Sugerida": st.column_config.NumberColumn("Base sugerida", format="R$ %.2f"),
                 "Budget_Proposto": st.column_config.NumberColumn("Budget proposto", format="R$ %.2f"),
                 "Ajuste_%": st.column_config.NumberColumn("Ajuste x base", format="%.1f%%"),
@@ -2524,6 +2622,103 @@ elif page == "Budget de Receita":
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         width="stretch",
     )
+
+
+# =========================================================
+# PÁGINA: PREMISSAS 2027
+# =========================================================
+elif page == "Premissas 2027":
+    hero("Premissas 2027", "Parâmetros oficiais do planejamento. A Controladoria mantém os valores e todas as áreas consultam a mesma referência.")
+
+    prem = premises.copy() if premises is not None else default_premises_df()
+    if prem.empty:
+        prem = default_premises_df()
+    prem["Valor"] = pd.to_numeric(prem["Valor"], errors="coerce")
+
+    filled = int(prem["Valor"].notna().sum())
+    total_prem = int(len(prem))
+    pending = max(total_prem - filled, 0)
+    last_updates = prem["Atualizado_Em"].fillna("").astype(str) if "Atualizado_Em" in prem.columns else pd.Series(dtype=str)
+    last_update = next((x for x in reversed(last_updates.tolist()) if x.strip()), "Ainda não salvo")
+
+    p1, p2, p3, p4 = st.columns(4)
+    with p1:
+        kpi("Premissas", f"{total_prem}", "Estrutura oficial do planejamento")
+    with p2:
+        kpi("Preenchidas", f"{filled}", pct(filled / total_prem) if total_prem else "0,0%")
+    with p3:
+        kpi("Pendentes", f"{pending}", "Valores ainda não definidos")
+    with p4:
+        kpi("Última atualização", last_update, "Horário de Brasília")
+
+    st.markdown(
+        "<div class='storage-note'><b>Importante:</b> nesta etapa as premissas são a referência oficial do Budget. "
+        "Elas ainda não alteram automaticamente o Budget de Receita aprovado; serão consumidas nas próximas camadas de despesas, margens e caixa.</div>",
+        unsafe_allow_html=True,
+    )
+
+    section("Premissas por área")
+    group_order = ["GERAL", "MICROTECH", "LOCACAO", "VENDAS", "ENDOSCOPIA"]
+    selected_groups = st.multiselect(
+        "Visualizar grupos", group_order, default=group_order,
+        format_func=lambda x: "Geral" if x == "GERAL" else line_label(x),
+    )
+    prem_view = prem[prem["Grupo"].isin(selected_groups)].copy() if selected_groups else prem.iloc[0:0].copy()
+    prem_view["Grupo_Visual"] = prem_view["Grupo"].map(lambda x: "Geral" if x == "GERAL" else line_label(x))
+    prem_view = prem_view.sort_values(["Grupo", "Premissa"]).reset_index(drop=True)
+
+    editor_cols = ["Premissa_ID", "Grupo_Visual", "Premissa", "Valor", "Unidade", "Observacao", "Atualizado_Por", "Atualizado_Em"]
+    if is_controladoria:
+        edited = st.data_editor(
+            prem_view[editor_cols], hide_index=True, width="stretch", key="premises_editor",
+            disabled=["Premissa_ID", "Grupo_Visual", "Premissa", "Unidade", "Atualizado_Por", "Atualizado_Em"],
+            column_config={
+                "Premissa_ID": None,
+                "Grupo_Visual": st.column_config.TextColumn("Área"),
+                "Premissa": st.column_config.TextColumn("Premissa"),
+                "Valor": st.column_config.NumberColumn("Valor", step=0.1, format="%.2f"),
+                "Unidade": st.column_config.TextColumn("Unidade"),
+                "Observacao": st.column_config.TextColumn("Observação / critério"),
+                "Atualizado_Por": st.column_config.TextColumn("Atualizado por"),
+                "Atualizado_Em": st.column_config.TextColumn("Atualizado em"),
+            },
+        )
+        if st.button("Salvar premissas", type="primary", width="stretch"):
+            # Atualiza somente os grupos exibidos, preservando os demais.
+            edited = edited.copy()
+            edited["Grupo"] = edited["Grupo_Visual"].map({
+                "Geral": "GERAL", "Microtech": "MICROTECH", "Locação": "LOCACAO",
+                "Vendas": "VENDAS", "Endoscopia": "ENDOSCOPIA",
+            })
+            edited = edited.drop(columns=["Grupo_Visual"], errors="ignore")
+            base = prem[~prem["Premissa_ID"].astype(str).isin(edited["Premissa_ID"].astype(str))].copy()
+            combined = pd.concat([base, edited], ignore_index=True)
+            try:
+                save_premises(user, combined)
+                st.success("Premissas 2027 salvas.")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Não foi possível salvar as premissas: {exc}")
+    else:
+        show = prem_view[["Grupo_Visual", "Premissa", "Valor", "Unidade", "Observacao", "Atualizado_Em"]].copy()
+        st.dataframe(
+            show, hide_index=True, width="stretch",
+            column_config={
+                "Grupo_Visual": st.column_config.TextColumn("Área"),
+                "Valor": st.column_config.NumberColumn("Valor", format="%.2f"),
+                "Observacao": st.column_config.TextColumn("Observação / critério"),
+                "Atualizado_Em": st.column_config.TextColumn("Atualizado em"),
+            },
+        )
+
+    section("Leitura rápida")
+    quick = prem[prem["Valor"].notna()].copy()
+    if quick.empty:
+        st.caption("As premissas começam em branco para que nenhum percentual ou câmbio seja assumido sem aprovação.")
+    else:
+        quick["Área"] = quick["Grupo"].map(lambda x: "Geral" if x == "GERAL" else line_label(x))
+        quick["Valor informado"] = quick.apply(lambda r: f"{float(r['Valor']):,.2f} {r['Unidade']}".replace(",", "X").replace(".", ",").replace("X", "."), axis=1)
+        st.dataframe(quick[["Área", "Premissa", "Valor informado", "Observacao"]], hide_index=True, width="stretch")
 
 
 # =========================================================
@@ -3285,6 +3480,19 @@ elif page == "Histórico":
         hb_show["Linha"] = hb_show["Linha"].map(line_label)
         hb_show = hb_show.rename(columns={"Data_Hora": "Data / hora", "Acao": "Ação", "Usuario": "Usuário"})
         st.dataframe(hb_show, width="stretch", hide_index=True)
+
+
+    section("Histórico das Premissas 2027")
+    if premises_history is None or premises_history.empty:
+        st.caption("Ainda não há alterações gravadas nas Premissas 2027.")
+    else:
+        ph = premises_history.copy()
+        ph["_ordem"] = pd.to_datetime(ph["Data_Hora"], format="%d/%m/%Y %H:%M:%S", errors="coerce")
+        ph = ph.sort_values("_ordem", ascending=False).drop(columns=["_ordem"])
+        st.dataframe(
+            ph[["Data_Hora", "Acao", "Usuario"]].rename(columns={"Data_Hora":"Data / hora", "Acao":"Ação", "Usuario":"Usuário"}),
+            hide_index=True, width="stretch",
+        )
 
 
 # =========================================================
